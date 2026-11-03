@@ -1,0 +1,13 @@
+# Build artifacts
+*.zip
+
+# Test / sample artifacts
+*.epub
+
+# Reference / scratch working files (not part of the plugin)
+moon-main/
+txtstyle.lua
+重启根因分析.md
+
+# Local environment
+.codebuddy/
