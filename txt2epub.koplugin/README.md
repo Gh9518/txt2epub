@@ -33,7 +33,7 @@ This plugin stands on the shoulders of the KOReader open-source community:
 - [Awesome KOReader](https://github.com/ruiribeiro04/awesome-koreader) — a curated community list of plugins & tools.
 - [doudou-xsz/txtstyle.koplugin](https://github.com/doudou-xsz/txtstyle.koplugin) — typography "quick styles" model (line-height, paragraph spacing, first-line indent, letter-spacing, justification).
 - [AnkioTomas/moon](https://github.com/AnkioTomas/moon) — robust chapter detection & paragraph reflow.
-- *toc_extractor* — multi-level TOC extraction ideas.
+- [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin) — multi-level TOC extraction ideas.
 
 Feedback and pull requests are welcome!
 
@@ -56,9 +56,9 @@ Feedback and pull requests are welcome!
 - **内存模型差异（说明）**：txtstyle 原版以常驻 `ApplyStyleSheet` 钩子实时注入 CSS，持续占用运行时内存/CPU；本插件改为转换时烘焙静态 `style.css`，不安装任何常驻钩子，对 KOReader 常驻内存为零增量。
 > 感谢作者给出的参数模型与字体枚举思路。
 
-### 3. toc_extractor（开源 TXT 目录抽取方案）
+### 3. [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin)（KOReader 插件）
 借鉴其**多级目录识别**思路：自动识别"卷 / 部 / 册 / 篇 → 章 / 回 → 节 / 集 / 幕"三级层级，在 `nav.xhtml` / `toc.ncx` 中生成真正的嵌套目录（而非平铺一长串），卷为顶层、章/回为一级、节/集/幕为二级。
-> 感谢社区在 TXT 目录抽取方向上的探索，为本插件的多级 TOC 提供了方向。
+> 感谢作者提供的 TXT 目录抽取方向与多级 TOC 实现思路。
 
 ---
 
@@ -123,7 +123,7 @@ Feedback and pull requests are welcome!
 
 > 注：旧版曾另有「每 3 次运行扫描同目录、删除 3 天前旧日志」的周期清理，用 `lfs.dir` 遍历整个书籍目录；在 Kindle 的慢速大目录（数百上千本书）上会卡住数秒到数十秒，表现为「点开始转换后卡在扫描目录」。现已**彻底移除目录遍历**，仅保留 O(1) 大小的单文件检查，绝不扫描目录、绝不因此卡顿。
 
-### 排版优化（借鉴 moon.koplugin / txtstyle.koplugin / toc_extractor）
+### 排版优化（借鉴 [AnkioTomas/moon](https://github.com/AnkioTomas/moon) / [doudou-xsz/txtstyle.koplugin](https://github.com/doudou-xsz/txtstyle.koplugin) / [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin)）
 
 本插件在核心转换层取长补短地吸收了多个开源项目的优点：
 
@@ -136,7 +136,7 @@ Feedback and pull requests are welcome!
   - **自定义 Custom**：在「排版预设 › 自定义参数…」里逐项微调行高 / 段距 / 首行缩进 / 字号缩放 / 字距 / 两端对齐，每个参数用**预设选项列表**点选（而非虚拟键盘逐字输入，规避墨水屏输入与部分输入法插件的崩溃），**即时保存**。选中它后即成为默认排版——因为所选预设会持久化，所以"每次转换若不修改就默认用这个模式"。自定义参数也可一键恢复为标准值。
   - **正文字体预览选择**：「排版预设 › 正文字体…」会列出 **KOReader 本机已安装的全部字体**（通过 `require("fontlist"):getFontList()` 读取字体文件路径，再经 `fontinfo` 取家族名），点击即可套用；列表底部附「手动输入字体名…」作为兜底（旧版 KOReader 取不到字体列表时回退此入口）。
   - **内存说明**：txtstyle 原版是把 CSS 通过 `ApplyStyleSheet` **常驻钩子**实时注入阅读器，会持续占用运行时内存/CPU；本插件改为在转换时把排版烘焙进静态 `style.css`，转换代码仅在触发转换时加载，**不安装任何常驻钩子，因此对 KOReader 的常驻内存为零增量**。
-- **多级目录**（来自 toc_extractor 的多级目录思路）：自动识别"卷 / 部 / 册 / 篇 → 章 / 回 → 节 / 集 / 幕"三级层级，在 `nav.xhtml` / `toc.ncx` 中生成真正的嵌套目录（而非平铺一长串），卷为顶层、章/回为一级、节/集/幕为二级。
+- **多级目录**（来自 [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin) 的多级目录思路）：自动识别"卷 / 部 / 册 / 篇 → 章 / 回 → 节 / 集 / 幕"三级层级，在 `nav.xhtml` / `toc.ncx` 中生成真正的嵌套目录（而非平铺一长串），卷为顶层、章/回为一级、节/集/幕为二级。
 - **超大章节切分**：单章 XHTML 超过 **256 KB** 时自动切分为多个文件（仅首分片入目录，续篇进正文流），避免单文件过大导致阅读器渲染卡顿/崩溃。
 - **墨水屏友好排版**：`style.css` 增加 `word-break: break-word`、`orphans/widows: 2`、章节标题 `page-break-after: avoid` 等，提升中文电子书阅读体验。
 
@@ -270,7 +270,7 @@ lua5.3 test/test_convert.lua
 
 **根因**：KOReader 在构建阅读菜单时，会调用每个插件的 `addToMainMenu(menu_items)`，随后用 `MenuSorter:mergeAndSort("reader", menu_items, order)` 把所有菜单项合并排序（见 `readermenu.lua`）。该函数**没有 `pcall` 保护**——一旦某个插件往 `menu_items` 里写入了与 MenuSorter 预期不符的结构（例如**手动改写内置 `menu_items.tools.sub_item_table`**、或子项缺少 `sorting_hint`），合并排序时就会抛错，导致**整个阅读菜单构建失败**，于是所有插件的菜单项全部消失。
 
-**本插件采用的标准写法**（与 KOReader 官方 `hello` / `toc_extractor` / `ComicMeta` 等一致）：
+**本插件采用的标准写法**（与 KOReader 官方 `hello` / [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin) / `ComicMeta` 等一致）：
 
 ```lua
 function TXT2EPUB:addToMainMenu(menu_items)
