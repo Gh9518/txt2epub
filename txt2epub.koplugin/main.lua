@@ -169,12 +169,57 @@ end
 -- 友好族名在 FontList.fontinfo[path][1].name（如 "Noto Serif CJK SC"）。
 -- 注意：ui/font 的 Font 对象【并没有】 getFontList 方法——旧实现误用 Font:getFontList()，
 -- 被 pcall 吞掉后恒返回空表，导致字体菜单永远只显示“请手动输入”、无法预览/选择已有字体。
+-- 取字体的“显示名”：本地化族名（中文界面→中文名）+ 样式（如 粗体/Bold）。
+-- info 为 fontinfo[path][1]（getInfo() 产物，含 name / bold / italic / names）。
+--   names 是 harfbuzz 名表：names[语言][name_id]，name_id 1=族名(FONT_FAMILY)、
+--   2=样式(FONT_SUBFAMILY)、4=全名(FULL_NAME)。中文界面下优先取 names["zh"] 的中文族名与样式。
+-- 取不到本地化名时，回退英文族名 + 由 bold/italic 推导的样式。
+function TXT2EPUB:_font_display(fam_en, info, lang)
+    local fam = fam_en
+    local style
+    local names = info and info.names
+    if type(names) == "table" then
+        -- 与 KOReader FontList:getLocalizedFontName 同口径：先精确语言，再退到语言主码（zh-CN→zh）
+        local loc = names[lang] or names[lang and lang:match("%w+")] or names["en"] or names["en-us"]
+        if type(loc) == "table" then
+            fam = loc[1] or loc[4] or fam        -- 1=FONT_FAMILY, 4=FULL_NAME
+            style = loc[2]                        -- 2=FONT_SUBFAMILY（如 “粗体”/“Bold”）
+        end
+    end
+    -- 样式兜底：由 bold/italic 布尔推导（英文）
+    if not style or style == "" then
+        if info then
+            local b = info.bold and true or false
+            local i = info.italic and true or false
+            if b and i then style = "Bold Italic"
+            elseif b then style = "Bold"
+            elseif i then style = "Italic"
+            else style = "Regular" end
+        else
+            style = "Regular"
+        end
+    end
+    if not fam or fam == "" then fam = fam_en end
+    style = (type(style) == "string" and style or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    -- Regular/常规 视为默认样式，不额外标注，避免列表冗余
+    if style:lower() == "regular" or style == "常规" or style == "标准" or style == "正常" or style == "" then
+        return fam
+    end
+    return fam .. " · " .. style
+end
+
 function TXT2EPUB:get_font_list()
     -- 缓存：字体列表一经扫描即复用，避免每次打开「正文字体…」都重扫字体目录
     -- （首次扫描在 Kindle 上可能耗时，正是“卡在扫描目录”的另一来源）。
     if self._font_cache and #self._font_cache > 0 then return self._font_cache end
     local out = {}
     local seen = {}
+    -- 当前 UI 语言主码（zh-CN→zh / en / ...），用于取本地化字体名
+    local lang = "en"
+    if G_reader_settings then
+        local L = G_reader_settings:readSetting("language")
+        if L then lang = tostring(L):lower():gsub("_", "-") end
+    end
     local ok, FontList = pcall(require, "fontlist")
     if ok and FontList and type(FontList.getFontList) == "function" then
         local ok2, fl = pcall(function() return FontList:getFontList() end)
@@ -185,15 +230,18 @@ function TXT2EPUB:get_font_list()
                 if type(p) == "string" then
                     local fam
                     local info = FontList.fontinfo and FontList.fontinfo[p]
-                    if type(info) == "table" and info[1] then
-                        fam = info[1].name
+                    local face = (type(info) == "table" and info[1]) or nil
+                    if face then
+                        fam = face.name
                     end
                     if not fam or fam == "" then
                         fam = p:match("([^/]+)%.%w+$") or p:match("([^/]+)$") or p
                     end
                     if fam and not seen[fam] then
                         seen[fam] = true
-                        out[#out + 1] = { name = fam, path = p }
+                        -- name：英文族名，作为存储值与 CSS font-family（系统可识别）
+                        -- display：本地化显示名（中文界面→中文名 + 样式），仅用于菜单展示
+                        out[#out + 1] = { name = fam, display = self:_font_display(fam, face, lang), path = p }
                     end
                 end
             end
@@ -204,7 +252,7 @@ function TXT2EPUB:get_font_list()
         for name in pairs(FontList.fontnames) do
             if type(name) == "string" and name ~= "" and not seen[name] then
                 seen[name] = true
-                out[#out + 1] = { name = name, path = "" }
+                out[#out + 1] = { name = name, display = name, path = "" }
             end
         end
         table.sort(out, function(a, b) return a.name < b.name end)
@@ -365,7 +413,8 @@ function TXT2EPUB:gen_font_menu()
     for _i, f in ipairs(fonts) do
         local font = f  -- 拷贝循环变量，避免闭包共享导致“选哪个字体都存成最后一个”
         items[#items + 1] = {
-            text = font.name,
+            -- display：本地化显示名（中文界面→中文名 + 样式）；font.name 仅用于存储/勾选/CSS
+            text = font.display or font.name,
             checked_func = function()
                 -- 实时读取当前选中字体（旧实现缓存 current，改动后勾选停留在旧值，用户以为“没选上”）
                 local cur = G_reader_settings and G_reader_settings:readSetting("txt2epub_font") or ""
@@ -399,11 +448,12 @@ end
 function TXT2EPUB:preview_font()
     local current = G_reader_settings and G_reader_settings:readSetting("txt2epub_font") or ""
     local path
+    local display = current ~= "" and current or _("默认衬线体")
     for _, f in ipairs(self:get_font_list()) do
-        if f.name == current then path = f.path break end
+        if f.name == current then path = f.path; display = f.display or f.name break end
     end
     local fallback = function()
-        UIManager:show(InfoMessage:new{ text = _("当前字体：") .. (current ~= "" and current or _("默认衬线体")), timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = _("当前字体：") .. display, timeout = 2 })
     end
     if not path then fallback() return end
 

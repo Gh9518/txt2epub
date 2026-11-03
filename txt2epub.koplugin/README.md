@@ -134,7 +134,8 @@ Feedback and pull requests are welcome!
   - **标准 Standard**（默认）：行距 155%、段距 0.3em、首行缩进 2 字宽——中文小说阅读舒适基准。
   - **宽松大字 Relaxed**：行距 185%、段距 0.6em、首行缩进 2 字宽、字号 115%——护眼大字版。
   - **自定义 Custom**：在「排版预设 › 自定义参数…」里逐项微调行高 / 段距 / 首行缩进 / 字号缩放 / 字距 / 两端对齐，每个参数用**预设选项列表**点选（而非虚拟键盘逐字输入，规避墨水屏输入与部分输入法插件的崩溃），**即时保存**。选中它后即成为默认排版——因为所选预设会持久化，所以"每次转换若不修改就默认用这个模式"。自定义参数也可一键恢复为标准值。
-  - **正文字体预览选择**：「排版预设 › 正文字体…」会列出 **KOReader 本机已安装的全部字体**（通过 `require("fontlist"):getFontList()` 读取字体文件路径，再经 `fontinfo` 取家族名），点击即可套用；列表底部附「手动输入字体名…」作为兜底（旧版 KOReader 取不到字体列表时回退此入口）。
+  - **正文字体预览选择**：「排版预设 › 正文字体…」会列出 **KOReader 本机已安装的全部字体**（通过 `require("fontlist"):getFontList()` 读取字体文件路径，再经 `fontinfo` / harfbuzz 名表取家族名），点击即可套用；列表底部附「手动输入字体名…」作为兜底（旧版 KOReader 取不到字体列表时回退此入口）。
+  - **字体名按界面语言本地化显示**：菜单里**中文字体显示中文族名**（如「思源宋体」），**英文字体显示英文族名**（如 `Noto Serif CJK SC`），并附样式（粗体 / 斜体 → `· Bold` / `· Italic`）。本地化名取自字体 SFNT 名表的对应语言项（复用 KOReader `FontList:getLocalizedFontName` 的取名字口径），取不到时回退英文族名 + 由 `bold`/`italic` 推导样式。注意：菜单展示名仅用于显示，**实际写入 EPUB 的仍是系统可识别的英文族名**（`font-family`），所以中文界面下选「思源宋体」生成的 EPUB 仍正确引用 `Noto Serif CJK SC`。
   - **内存说明**：txtstyle 原版是把 CSS 通过 `ApplyStyleSheet` **常驻钩子**实时注入阅读器，会持续占用运行时内存/CPU；本插件改为在转换时把排版烘焙进静态 `style.css`，转换代码仅在触发转换时加载，**不安装任何常驻钩子，因此对 KOReader 的常驻内存为零增量**。
 - **多级目录**（来自 [michael-galaxy/toc_extractor.koplugin](https://github.com/michael-galaxy/toc_extractor.koplugin) 的多级目录思路）：自动识别"卷 / 部 / 册 / 篇 → 章 / 回 → 节 / 集 / 幕"三级层级，在 `nav.xhtml` / `toc.ncx` 中生成真正的嵌套目录（而非平铺一长串），卷为顶层、章/回为一级、节/集/幕为二级。
 - **超大章节切分**：单章 XHTML 超过 **256 KB** 时自动切分为多个文件（仅首分片入目录，续篇进正文流），避免单文件过大导致阅读器渲染卡顿/崩溃。
@@ -332,9 +333,11 @@ end
 
 ```bash
 lua5.3 test/test_convert.lua          # 单元测试：27 项（ZIP 结构/章节切分/GBK/回退）
+lua5.3 test/test_font_display.lua     # 字体显示测试：10 项（中/英文族名与样式本地化、回退路径、存储值始终为英文族名）
 luajit  test/test_runtime.lua         # 运行时测试：21 项（模拟点击转换，验证协程逐章 yield 不 panic + 进度框/完成提示必被创建）
 luajit  test/test_edge.lua            # 边界测试：15 项（UTF-8 BOM / GBK / 9MB 单行 / 中文路径 / 空文件）
 luajit  test/test_stream.lua          # 流式构建测试：23 项（含「前64KB切在多字节中途的UTF-8」OOM回归用例）
+lua5.3 test/test_menu.lua             # 菜单测试：含闭包捕获、_() 遮蔽、sub_item_table_func 等回归断言
 ```
 
 `test_runtime.lua` 用最小 KOReader 运行时桩**复现「点击开始转换 → 协程逐章 yield → 完成」的完整路径**：它把 `UIManager:nextTick` 改为入队，再用 `drain_next_ticks()` 模拟真实 UI 主循环逐个执行。其中 **「大书(120章) 分多次 UI tick 完成」** 这一项专门统计 `nextTick` 被入队次数——120 章的书会被切分成**多次 UI 节拍**完成（而非一次阻塞调用），直接证明主线程已被分片、不会再触发看门狗/ANR。只要测试不 panic 且断言全过，即可确认真机上点转换不会再导致 KOReader 崩溃退出。
