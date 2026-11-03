@@ -2,12 +2,7 @@
 
 在 KOReader 中打开一个 `.txt` 文件后，通过菜单「**工具 › TXT2EPUB**」一键把当前 TXT 转换为**同名 `.epub`**，并保存在原文件同一目录。生成的 EPUB 带有可跳转的**多级章节目录**（同时兼容 EPUB3 `nav.xhtml` 与 EPUB2 `toc.ncx`，KOReader 的目录面板均可识别），并内置借鉴开源项目的排版精修。
 
-> 本项目在转换层取长补短地借鉴了两个开源 KOReader 插件：
-> - **[doudou-xsz/txtstyle.koplugin](https://github.com/doudou-xsz/txtstyle.koplugin)**：把"行高 / 段距 / 首行缩进 / 字距 / 两端对齐"等排版参数做成可一键套用的"快速风格"预设。本插件把这套参数模型在**转换时**一次性烘焙进 EPUB 的 `style.css`（而非安装常驻阅读钩子）。
-> - **toc_extractor（开源 TXT 目录抽取）**：多级目录识别思路。本插件据此在转换时为"卷 / 章 / 节"自动分级，生成真正的多级嵌套目录。
-> - 此前已落地的 [AnkioTomas/moon](https://github.com/AnkioTomas/moon) 稳健章节识别与段落回流合并，本版继续保留。
-
-> **运行平台与生态**：[koreader/koreader](https://github.com/koreader/koreader)（开源阅读器本体）、[koreader/contrib](https://github.com/koreader/contrib)（官方社区插件集合）、[Awesome KOReader](https://github.com/ruiribeiro04/awesome-koreader)（社区插件与工具清单）。欢迎提交 Issue / PR 一起完善。
+> 本项目在转换层借鉴了多个开源项目的**代码与方案**，具体的借鉴内容与致谢见下方「致谢与开源借鉴」一节。
 
 ---
 
@@ -41,6 +36,35 @@ This plugin stands on the shoulders of the KOReader open-source community:
 - *toc_extractor* — multi-level TOC extraction ideas.
 
 Feedback and pull requests are welcome!
+
+---
+
+## 致谢与开源借鉴（Attribution）
+
+本插件在转换层取长补短地借鉴了以下开源项目的**代码与方案**，在此郑重致谢：
+
+### 1. [AnkioTomas/moon](https://github.com/AnkioTomas/moon)（KOReader 插件）
+借鉴其**稳健的章节标题识别**与**段落回流合并**两大方案：
+- **章节识别**：中文数字校验（含 `零〇一二…十百千万两`）、英文 `Chapter/Section/Page` 序号、特例标题（序章/序言/前言/楔子/引子/尾声/后记/番外/终章/附录等）；并过滤"第一部门/部队"这类正文误判为"部"章节、"第二回的内容"这类正文行误判为标题的情况。
+- **段落回流**：把被软换行拆散的物理行，按"句末标点 / 空行 / 列表项 / 对话句首"重新聚合为逻辑段落，避免"一行一段"导致首行缩进与两端对齐失效。
+> 感谢作者提供的成熟思路，本插件在**转换阶段**直接复用其判定逻辑，而非在阅读时挂常驻钩子。
+
+### 2. [doudou-xsz/txtstyle.koplugin](https://github.com/doudou-xsz/txtstyle.koplugin)（KOReader 插件）
+借鉴其**排版"快速风格"参数模型**与**正文字体选择**方案：
+- **参数模型**：将行高、段距、首行缩进、字号缩放、字距、两端对齐等参数做成可一键套用的"紧凑 / 标准 / 宽松大字"三套预设，在**转换时**一次性烘焙进 EPUB 的 `style.css`。
+- **字体枚举**：通过 `require("fontlist"):getFontList()` 读取本机已安装字体路径、再经 `fontinfo` 取家族名来列出可选字体；旧版 KOReader 取不到时回退"手动输入字体名"。
+- **内存模型差异（说明）**：txtstyle 原版以常驻 `ApplyStyleSheet` 钩子实时注入 CSS，持续占用运行时内存/CPU；本插件改为转换时烘焙静态 `style.css`，不安装任何常驻钩子，对 KOReader 常驻内存为零增量。
+> 感谢作者给出的参数模型与字体枚举思路。
+
+### 3. toc_extractor（开源 TXT 目录抽取方案）
+借鉴其**多级目录识别**思路：自动识别"卷 / 部 / 册 / 篇 → 章 / 回 → 节 / 集 / 幕"三级层级，在 `nav.xhtml` / `toc.ncx` 中生成真正的嵌套目录（而非平铺一长串），卷为顶层、章/回为一级、节/集/幕为二级。
+> 感谢社区在 TXT 目录抽取方向上的探索，为本插件的多级 TOC 提供了方向。
+
+---
+
+本插件运行于 **[KOReader](https://github.com/koreader/koreader)** 开源阅读器之上，并遵循其插件规范（`*.koplugin` 目录 + `_meta.lua` + `main.lua`，由 PluginLoader 在启动时加载）。如果你觉得有用，欢迎：
+- 给本仓库点个 Star ⭐；
+- 向 [koreader/contrib](https://github.com/koreader/contrib)（官方社区插件集合）或 [Awesome KOReader](https://github.com/jannick-holm/awesome-koreader) 提交收录，让更多 KOReader 用户发现它。
 
 ---
 
