@@ -54,7 +54,7 @@ function TXT2EPUB:addToMainMenu(menu_items)
                     self:convert()
                 end,
                 enabled_func = function()
-                    return self:is_txt_file()
+                    return self:is_supported_file()
                 end,
             },
             {
@@ -101,9 +101,25 @@ end
 -- 文件类型校验
 ------------------------------------------------------------------------
 function TXT2EPUB:is_txt_file()
+    return self:file_ext() == ".txt"
+end
+
+-- 支持的源文件：TXT 与 Word(.docx)。旧版 .doc（二进制 OLE2）暂不支持。
+function TXT2EPUB:is_docx_file()
+    return self:file_ext() == ".docx"
+end
+
+-- 取得当前文档的扩展名（小写，含点），如 ".txt" / ".docx" / ".doc"
+function TXT2EPUB:file_ext()
     local file = self.ui and self.ui.document and self.ui.document.file
-    if not file then return false end
-    return string.lower(string.sub(file, -4)) == ".txt"
+    if not file or file == "" then return nil end
+    local e = string.lower(file:match("%.([^%.]+)$") or "")
+    if e == "" then return nil end
+    return "." .. e
+end
+
+function TXT2EPUB:is_supported_file()
+    return self:is_txt_file() or self:is_docx_file()
 end
 
 ------------------------------------------------------------------------
@@ -787,19 +803,31 @@ function TXT2EPUB:_safe(fn, ctx)
 end
 
 function TXT2EPUB:convert()
-    if not self:is_txt_file() then
-        UIManager:show(InfoMessage:new{ text = _("请先打开 TXT 文件") })
+    local file = self.ui and self.ui.document and self.ui.document.file
+    if not file then
+        UIManager:show(InfoMessage:new{ text = _("请先打开 TXT 或 Word(.docx) 文档") })
+        return
+    end
+    local ext = self:file_ext()
+    if ext == ".docx" then
+        -- Word 文档：直接走 docx 转换流程（标题层级取自 Word 样式，无需章节标题预检）
+    elseif ext == ".txt" then
+        -- 文本文档：走既有 TXT 流程
+    elseif ext == ".doc" then
+        UIManager:show(InfoMessage:new{ text = _("暂不支持旧版 .doc 格式。\n请在 Word / WPS 中“另存为” .docx 后重试。") })
+        return
+    else
+        UIManager:show(InfoMessage:new{ text = _("请先打开 TXT 或 Word(.docx) 文档") })
         return
     end
 
-    local file = self.ui.document.file
     self:_set_log(file)
     self:_maintain_log(file)
-    self:_log("== 开始转换流程，源文件：" .. tostring(file))
+    self:_log("== 开始转换流程，源文件：" .. tostring(file) .. "  类型：" .. tostring(ext))
 
     self:_safe(function()
         local name = util.basename(file)
-        local base = name:gsub("%.txt$", ""):gsub("%.TXT$", "")
+        local base = name:gsub("%.docx$", ""):gsub("%.DOCX$", ""):gsub("%.txt$", ""):gsub("%.TXT$", "")
         local out_path = util.joinPath(util.dirname(file), base .. ".epub")
 
         -- 输出已存在 -> 询问是否覆盖
@@ -809,14 +837,23 @@ function TXT2EPUB:convert()
                 ok_text = _("覆盖"),
                 cancel_text = _("取消"),
                 ok_callback = function()
-                    self:_check_title_and_run(file, out_path, base)
+                    self:_dispatch_convert(file, out_path, base, ext)
                 end,
             })
             return
         end
 
-        self:_check_title_and_run(file, out_path, base)
+        self:_dispatch_convert(file, out_path, base, ext)
     end, "convert")
+end
+
+-- 按文件类型分派到对应的转换流程
+function TXT2EPUB:_dispatch_convert(file, out_path, base, ext)
+    if ext == ".docx" then
+        self:_safe(function() self:_run_docx(file, out_path, base) end, "docx 转换")
+    else
+        self:_check_title_and_run(file, out_path, base)
+    end
 end
 
 -- 预检标题；若无任何章节标题，提示可用“空格缩进”识别目录层级
@@ -1060,6 +1097,72 @@ function TXT2EPUB:_do_convert_indent(file, out_path, base, total)
         self:_log("EPUB 生成成功（缩进模式），共 " .. n .. " 个条目：" .. out_path)
     end
     return { count = n, empty = empty }
+end
+
+------------------------------------------------------------------------
+-- Word(.docx) 转换入口（参照 _run，但在协程中执行、逐章 yield，避免主线程阻塞）
+------------------------------------------------------------------------
+function TXT2EPUB:_run_docx(file, out_path, base)
+    self:_open_progress(nil, "build")
+    self:_async_run(
+        function()
+            self._in_async = true   -- 标记：当前处于 _async_run 创建的协程内，on_yield 方可让出主线程
+            local r = self:_do_convert_docx(file, out_path, base)
+            self._in_async = false
+            return r
+        end,
+        function(err)
+            self._in_async = false
+            self:_close_progress()
+            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+        end,
+        function(res)
+            self:_close_progress()
+            res = res or {}
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("✓ 转换完成：共 %d 章\n已保存：\n%s"), res.count or 0, out_path),
+                timeout = 5,
+            })
+        end
+    )
+end
+
+-- 实际转换：直接调用 converter 的 docx 流水线（逐章写出、随即释放，内存只保留一章量级）
+function TXT2EPUB:_do_convert_docx(file, out_path, base)
+    local opts = {
+        indent = self:get_indent(),
+        style = self:get_style(),
+        book_title = base,
+        uid = "urn:uuid:" .. Converter.gen_uid(),
+        modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    self:_log("开始由 Word 生成 EPUB：" .. out_path)
+    local build_ok, count
+    local status, perr = pcall(function()
+        build_ok, count = Converter.build_epub_from_docx(file, out_path, opts, {
+            -- 仅当处于 _async_run 创建的协程内（self._in_async 置位）才让出主线程，
+            -- 用显式标志位避开各 Lua 版本 coroutine.running() 语义差异。
+            on_yield = function()
+                if self._in_async then coroutine.yield() end
+            end,
+            on_progress = function(i)
+                self._progress_i = i
+                self._progress_total = nil
+                if i % 25 == 0 then
+                    self:_log(string.format("写入进度：%d 章", i))
+                end
+            end,
+        })
+    end)
+    if not status then
+        error("生成 EPUB 失败：" .. tostring(perr))
+    end
+    if not build_ok then
+        error("生成 EPUB 失败")
+    end
+    self:_set_progress(count, nil)  -- 收尾刷新到 100%
+    self:_log("EPUB 生成成功（Word），共 " .. count .. " 章：" .. out_path)
+    return { count = count }
 end
 
 return TXT2EPUB

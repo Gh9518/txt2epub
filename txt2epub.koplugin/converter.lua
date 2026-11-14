@@ -1545,4 +1545,148 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
     return true, #toc, empty
 end
 
+------------------------------------------------------------------------
+-- 9d. 从 Word(.docx) 转换：解析 OOXML -> 按 Word 标题层级生成多级 EPUB
+--   与 build_epub_streaming 同样“逐章写出、随即释放”，内存只保留一章量级。
+--   path     : .docx 文件完整路径
+--   out_path : 输出 .epub 路径
+--   opts     : { indent, style, book_title, uid, modified }
+--   hooks    : { on_yield, on_progress }（同 build_epub_streaming）
+--   返回：true, count（EPUB 章节文件数）
+------------------------------------------------------------------------
+function Converter.build_epub_from_docx(path, out_path, opts, hooks)
+    opts = opts or {}
+    local indent = opts.indent or "2em"
+    local uid = opts.uid or ("urn:uuid:" .. Converter.gen_uid())
+    local modified = opts.modified or os.date("!%Y-%m-%dT%H:%M:%SZ")
+
+    local ok, DocxReader = pcall(require, "docx")
+    if not ok or not DocxReader then
+        error("无法加载 docx 解析模块（docx.lua 缺失）")
+    end
+    local doc, derr = DocxReader.read(path)
+    if not doc then
+        error("读取 Word 文档失败：" .. tostring(derr))
+    end
+
+    local book_title = doc.title or opts.book_title or "未命名"
+    local paragraphs = doc.paragraphs or {}
+
+    local zip = ZipWriter:new(out_path)
+    zip:add("mimetype", "application/epub+zip")
+
+    local toc = {}
+    local i = 0
+    local MAX_CHAPTER_BYTES = 256 * 1024
+
+    local function emit(title, paras, level)
+        level = level or 0
+        i = i + 1
+        local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
+        if #xhtml > MAX_CHAPTER_BYTES and #paras > 1 then
+            local chunk = {}
+            local size = 0
+            local part = 1
+            local function flush_part()
+                if #chunk == 0 then return end
+                local t = (part == 1) and title or (title .. "（" .. part .. "）")
+                local px = Converter.build_chapter_xhtml(t, chunk, indent, level)
+                local fname = string.format("OEBPS/chapter_%04d%s.xhtml", i, (part == 1) and "" or ("_" .. part))
+                zip:add(fname, px)
+                toc[#toc + 1] = { file = fname, title = t, level = level, toc = (part == 1) }
+                part = part + 1
+                chunk = {}
+                size = 0
+                if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
+                if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end
+                if i % 5 == 0 then collectgarbage("collect") end
+            end
+            for _, p in ipairs(paras) do
+                if size > 0 and size + #p + 64 > MAX_CHAPTER_BYTES then
+                    flush_part()
+                end
+                chunk[#chunk + 1] = p
+                size = size + #p
+            end
+            flush_part()
+        else
+            local fname = string.format("OEBPS/chapter_%04d.xhtml", i)
+            zip:add(fname, xhtml)
+            toc[#toc + 1] = { file = fname, title = title, level = level, toc = true }
+            paras = nil
+            if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
+            if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end
+            if i % 5 == 0 then collectgarbage("collect") end
+        end
+    end
+
+    --------------------------------------------------------------------
+    -- 把 docx 段落序列聚合成章节：标题段开启新章（带 Word 层级），
+    -- 其后的正文段成为该章段落；首标题之前的 body 并入首章开头。
+    --------------------------------------------------------------------
+    local current = nil
+    local leading = {}          -- 首个标题之前的正文
+    local seen_heading = false
+    local norm = function(s) return (s or ""):gsub("%s+", "") end
+
+    local function start_chapter(title, level)
+        if #leading > 0 then
+            current = { title = title, paras = leading, level = level }
+            leading = {}
+        else
+            current = { title = title, paras = {}, level = level }
+        end
+        seen_heading = true
+    end
+
+    for _, p in ipairs(paragraphs) do
+        if p.kind == "heading" then
+            local title = (p.text and p.text ~= "") and p.text or ("（未命名标题 " .. (p.level or 1) .. "）")
+            -- 首个标题若与书名相同（如 Word 的 Title 样式段落），视为书名，不单独成章
+            if not seen_heading and norm(title) == norm(book_title) then
+                seen_heading = true
+                current = nil
+            else
+                if current then
+                    emit(current.title, current.paras, current.level)
+                    current = nil
+                end
+                start_chapter(title, p.level or 1)
+            end
+        else
+            if p.text and p.text ~= "" then
+                if seen_heading then
+                    if not current then
+                        current = { title = book_title, paras = {}, level = 1 }
+                    end
+                    current.paras[#current.paras + 1] = p.text
+                else
+                    leading[#leading + 1] = p.text
+                end
+            end
+        end
+    end
+    if current then
+        emit(current.title, current.paras, current.level)
+    end
+    if #toc == 0 then
+        -- 文档无任何标题（理论上不会发生，保险回退）
+        emit(book_title, leading, 0)
+    end
+
+    local toc_for_nav = {}
+    for _, e in ipairs(toc) do
+        if e.toc ~= false then toc_for_nav[#toc_for_nav + 1] = e end
+    end
+    local nested = Converter.nest_toc(toc_for_nav)
+    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
+    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
+    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
+    zip:add("OEBPS/content.opf", Converter.build_opf(toc, book_title, uid, modified))
+    zip:add("META-INF/container.xml", Converter.build_container())
+    zip:close()
+    collectgarbage("collect")
+    return true, #toc
+end
+
 return Converter
