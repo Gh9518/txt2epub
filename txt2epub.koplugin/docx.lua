@@ -413,6 +413,15 @@ local function read_impl(path)
     if core_xml then title = extract_core_title(core_xml) end
 
     local paragraphs = DocxReader.parse_document_xml(doc_xml)
+    -- 主动释放大对象：ZIP 原始字节（2.8MB）与解压后的 document.xml（2.7MB）
+    -- 若一直留到函数返回，会和 7000+ 个段落 table 同时压在 Lua 堆上；
+    -- Kindle 剩余内存本就紧张，这正是大 .docx 转换被 OOM killer 杀掉时
+    -- crash.log 只留一行 "Killed"（没有 Lua 堆栈）的原因。
+    doc_xml, core_xml, derr = nil, nil, nil
+    self.data = nil
+    zip.data = nil
+    data = nil
+    collectgarbage("collect")
     return { title = title, paragraphs = paragraphs }
 end
 

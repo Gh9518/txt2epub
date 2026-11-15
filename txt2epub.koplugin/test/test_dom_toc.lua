@@ -13,7 +13,7 @@
 --   3) 按页聚合残留的 <html>/<head>/<body> 被清理，正文完整不丢
 --   4) 单章 XHTML 不超过 300KB
 --   5) 已有完整 TOC 的场景不被重切分破坏
---   6) 正文无任何标题时保持原行为（按字节硬切，目录仅书名 1 条）
+--   6) 正文无任何标题时按字节硬切，但所有分片都进目录（不再只剩 1 条）
 --   7) <hN> 标签层级 + 数字字符实体（&#x...;）标题
 --   8) 纯文本 + 换行（无块标签）的兜底切分
 --   9) stats.detected_titles / stats.resplit 诊断字段
@@ -219,8 +219,8 @@ check("用例3：stats.resplit = false", stats and stats.resplit == false)
 check("用例3：识别到 0 个标题", stats and stats.detected_titles == 0,
     "got " .. tostring(stats and stats.detected_titles))
 local ncx3 = epub_entry(out, "OEBPS/toc.ncx")
-check("用例3：目录仅 1 个 navPoint（续篇不计入）",
-    count_occurrences(ncx3, "<navPoint", true) == 1,
+check("用例3：无标题时每个硬切分片都进目录（navPoint >= 2）",
+    count_occurrences(ncx3, "<navPoint", true) >= 2,
     "got " .. count_occurrences(ncx3, "<navPoint", true))
 local max3 = epub_max_chapter_size(out)
 check("用例3：所有章节 XHTML < 300KB", max3 > 0 and max3 < 300 * 1024,

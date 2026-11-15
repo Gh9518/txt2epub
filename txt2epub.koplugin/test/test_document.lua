@@ -138,8 +138,8 @@ ok, count = Converter.build_epub_from_document(doc4, out, { book_title = "大书
 check("用例4：返回成功", ok == true)
 check("用例4：超长章节被切分为多文件（count >= 2）", count >= 2, "got " .. tostring(count))
 local ncx = epub_entry(out, "OEBPS/toc.ncx")
-check("用例4：ncx 仅首个分片计入目录（唯一章 title 出现一次）",
-    select(2, ncx:gsub("唯一章", "唯一章")) == 1)
+check("用例4：ncx 每个硬切分片都计入目录（唯一章出现 >= 2 次）",
+    select(2, ncx:gsub("唯一章", "唯一章")) >= 2)
 
 ------------------------------------------------------------------------
 print(string.format("\n==== test_document 结果：%d 通过 / %d 失败 ====", passed, failed))

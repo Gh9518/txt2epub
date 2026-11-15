@@ -102,6 +102,17 @@ end
 ------------------------------------------------------------------------
 -- 文件类型校验
 ------------------------------------------------------------------------
+-- 可由插件「自解析」的扩展名（读磁盘源文件，结果与 KOReader 版本无关）：
+--   .txt                  -> 章节正则 / 空格缩进
+--   .docx                 -> OOXML（Word 标题样式 -> 多级目录）
+--   .html/.htm/.md/.markdown -> markup.lua（<hN> / # 标题 -> 多级目录）
+-- 其余格式（.doc/.rtf/.fb2/.epub 等）走 KOReader 已打开文档的 DOM 兜底。
+local SELF_PARSE_EXT = {
+    [".txt"] = true, [".docx"] = true,
+    [".html"] = true, [".htm"] = true,
+    [".md"] = true, [".markdown"] = true,
+}
+
 function TXT2EPUB:is_txt_file()
     return self:file_ext() == ".txt"
 end
@@ -825,7 +836,7 @@ function TXT2EPUB:pick_and_convert(start_path)
     local items = self:_list_sources(path)
 
     local picker = Menu:new{
-        title = _("选择要转换的文件（.txt / .doc / .docx / .rtf / .fb2 / .html / .epub）") .. "\n" .. path,
+        title = _("选择要转换的文件（.txt / .docx / .html / .htm / .md / .doc / .epub）") .. "\n" .. path,
         item_table = items,
         is_popout = false,
         is_borderless = false,
@@ -838,7 +849,7 @@ function TXT2EPUB:pick_and_convert(start_path)
                 -- 进入子目录 / 返回上级
                 self:pick_and_convert(item.path)
             else
-                -- 选中源文件，交给 convert() 处理（此时 ext 必为 .txt/.docx）
+                -- 选中源文件，交给 convert() 按扩展名自动分派
                 self:convert(item.path)
             end
         end,
@@ -846,14 +857,14 @@ function TXT2EPUB:pick_and_convert(start_path)
     UIManager:show(picker)
 end
 
--- 选择器起始目录：若当前打开的是真实 .txt/.docx 则用它所在目录；
+-- 选择器起始目录：若当前打开的是插件可自解析的格式则用它所在目录；
 -- 否则回退到 KOReader 主页目录 / 当前工作目录，避免落在 KOReader 内部临时目录。
 function TXT2EPUB:_start_dir()
     local lfs = require("libs/libkoreader-lfs")
     local cur = self:_current_file()
     if cur then
         local e = self:file_ext(cur)
-        if e == ".txt" or e == ".docx" then
+        if SELF_PARSE_EXT[e] then
             local d = cur:match("(.*)/") or cur:match("(.*)\\")
             if d and lfs.attributes(d, "mode") == "directory" then return d end
         end
@@ -876,7 +887,7 @@ function TXT2EPUB:_normalize_dir(p)
     return p
 end
 
--- 列出目录内可选项：父目录“..”、子目录、以及 .txt/.docx 文件；目录在前、文件在后
+-- 列出目录内可选项：父目录“..”、子目录、以及可转换格式的文件；目录在前、文件在后
 function TXT2EPUB:_list_sources(path)
     local lfs = require("libs/libkoreader-lfs")
     local items = {}
@@ -893,9 +904,9 @@ function TXT2EPUB:_list_sources(path)
                     table.insert(items, { text = f .. "/", path = full, is_dir = true })
                 elseif attr.mode == "file" then
                     local e = string.lower(f:match("%.([^%.]+)$") or "")
-                    -- 文件选择器主要服务于 .txt；其它格式建议在阅读器内直接打开后转换
-                    if e == "txt" or e == "doc" or e == "docx" or e == "rtf"
-                        or e == "fb2" or e == "html" or e == "htm" or e == "epub" then
+                    if e == "txt" or e == "docx" or e == "html" or e == "htm"
+                        or e == "md" or e == "markdown"
+                        or e == "doc" or e == "rtf" or e == "fb2" or e == "epub" then
                         table.insert(items, { text = f, path = full, is_dir = false })
                     end
                 end
@@ -1117,9 +1128,16 @@ function TXT2EPUB:_do_convert_document(doc_api, out_path, base)
     stats = stats or {}
     local visible = stats.visible_chars or 0
     local toc_n = stats.toc_entries or 0
-    self:_log(string.format("DOM 提取体检：可见正文 %d 字符，TOC 条目 %d，正文标题 %d，重切分 %s，章节 %d",
+    self:_log(string.format("DOM 提取体检：可见正文 %d 字符，TOC 条目 %d，正文标题 %d，重切分 %s（%s），章节 %d",
         visible, toc_n, stats.detected_titles or 0,
-        stats.resplit and "是" or "否", count or 0))
+        stats.resplit and "是" or "否", tostring(stats.resplit_mode or "否"), count or 0))
+    local sample = tostring(stats.html_sample or ""):gsub("%c", " ")
+    if sample ~= "" then
+        self:_log("DOM HTML 样本（前 160 字节）：" .. sample)
+    end
+    if (stats.detected_titles or 0) == 0 then
+        self:_log("提示：正文未识别到章节标题，目录已按分片逐条生成（可跳转但无语义层级）")
+    end
     if Converter.is_empty_document_result(stats) then
         pcall(os.remove, out_path)
         error(_("无法从阅读器提取该文档正文。\n\nKOReader 对此格式的解析结果不含可用正文/目录。\n建议：在 Word / WPS 中「另存为 .docx」后重新转换（.docx 由插件直接解析，结果最完整）。"))
@@ -1136,7 +1154,9 @@ function TXT2EPUB:convert(file)
     --   .docx  -> 插件自解析：直接读 OOXML，Word 标题样式 -> 多级目录 + 完整正文
     --            ★ 不走 KOReader DOM：真机验证 CreDocument 对 Word 文档 getToc()
     --              只有 1 条、getHTMLFromXPointer 只返回单节点，会产出空书。
-    --   .doc / .rtf / .fb2 / .epub / .html 等
+    --   .html / .htm / .md / .markdown
+    --          -> 插件自解析：markup.lua 按 <hN> / # 标题生成多级目录
+    --   .doc / .rtf / .fb2 / .epub 等
     --          -> 通用 DOM 流程兜底（KOReader 能打开但插件无专用解析器），
     --             带空结果体检，提取不到正文时明确提示而非交出空壳 EPUB。
     local doc = self.ui and self.ui.document or nil
@@ -1144,17 +1164,17 @@ function TXT2EPUB:convert(file)
     local ext = file and self:file_ext(file) or nil
 
     if not doc and not file then
-        -- 没有任何已打开文档：打开文件选择器（主要针对 .txt）
+        -- 没有任何已打开文档：打开文件选择器
         self:pick_and_convert()
         return
     end
-    if ext ~= ".txt" and ext ~= ".docx" then
+    if not SELF_PARSE_EXT[ext] then
         -- 插件无专用解析器的格式：交给通用 DOM 流程（或提示在 KOReader 中打开）
         if doc then
             self:_convert_document(doc, file)
         else
             UIManager:show(InfoMessage:new{
-                text = _("请在 KOReader 中打开该文档后再转换。\n本插件可直接转换已打开的 .doc / .docx / .rtf / .fb2 / .epub / .html 等文档。"),
+                text = _("请在 KOReader 中打开该文档后再转换。\n本插件可直接转换 .txt / .docx / .html / .htm / .md 文件；.doc / .rtf / .fb2 / .epub 等请在阅读器内打开后转换。"),
             })
         end
         return
@@ -1167,7 +1187,9 @@ function TXT2EPUB:convert(file)
 
     self:_safe(function()
         local name = util.basename(file)
-        local base = name:gsub("%.docx$", ""):gsub("%.DOCX$", ""):gsub("%.txt$", ""):gsub("%.TXT$", "")
+        -- 去掉最后一个扩展名即可（.txt/.docx/.html/.htm/.md/.markdown 通用）
+        local base = name:gsub("%.[^%.]+$", "")
+        if base == "" then base = "未命名" end
         local out_path = util.joinPath(util.dirname(file), base .. ".epub")
 
         -- 输出已存在 -> 询问是否覆盖
@@ -1191,6 +1213,8 @@ end
 function TXT2EPUB:_dispatch_convert(file, out_path, base, ext)
     if ext == ".docx" then
         self:_safe(function() self:_run_docx(file, out_path, base) end, "docx 转换")
+    elseif ext == ".html" or ext == ".htm" or ext == ".md" or ext == ".markdown" then
+        self:_safe(function() self:_run_markup(file, out_path, base) end, "标记文档转换")
     else
         self:_check_title_and_run(file, out_path, base)
     end
@@ -1502,6 +1526,69 @@ function TXT2EPUB:_do_convert_docx(file, out_path, base)
     end
     self:_set_progress(count, nil)  -- 收尾刷新到 100%
     self:_log("EPUB 生成成功（Word），共 " .. count .. " 章：" .. out_path)
+    return { count = count }
+end
+
+------------------------------------------------------------------------
+-- Markdown / HTML 转换入口（与 docx 一样在协程里逐章 yield，避免阻塞主线程）
+------------------------------------------------------------------------
+function TXT2EPUB:_run_markup(file, out_path, base)
+    self:_open_progress(nil, "build")
+    self:_async_run(
+        function()
+            self._in_async = true
+            local r = self:_do_convert_markup(file, out_path, base)
+            self._in_async = false
+            return r
+        end,
+        function(err)
+            self._in_async = false
+            self:_close_progress()
+            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+        end,
+        function(res)
+            self:_close_progress()
+            res = res or {}
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("✓ 转换完成：共 %d 章\n已保存：\n%s"), res.count or 0, out_path),
+                timeout = 5,
+            })
+        end
+    )
+end
+
+function TXT2EPUB:_do_convert_markup(file, out_path, base)
+    local opts = {
+        indent = self:get_indent(),
+        style = self:get_style(),
+        book_title = base,
+        uid = "urn:uuid:" .. Converter.gen_uid(),
+        modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    self:_log("开始由标记文档生成 EPUB：" .. out_path)
+    local build_ok, count
+    local status, perr = pcall(function()
+        build_ok, count = Converter.build_epub_from_markup(file, out_path, opts, {
+            on_yield = function()
+                if self._in_async then coroutine.yield() end
+            end,
+            on_progress = function(i)
+                self._progress_i = i
+                self._progress_total = nil
+                if i % 25 == 0 then
+                    self:_log(string.format("写入进度：%d 章", i))
+                end
+            end,
+        })
+    end)
+    if not status then
+        error("生成 EPUB 失败：" .. tostring(perr))
+    end
+    if not build_ok then
+        error("生成 EPUB 失败")
+    end
+    self:_set_progress(count, nil)
+    self:_log("EPUB 生成成功（标记文档），共 " .. count .. " 章：" .. out_path)
     return { count = count }
 end
 

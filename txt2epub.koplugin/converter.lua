@@ -17,18 +17,46 @@ local Converter = {}
 -- 1. 32 位无符号整数 / 位运算（不依赖 C 扩展或 Lua 5.3 原生位运算）
 ------------------------------------------------------------------------
 -- 32 位按位异或（输入、输出均视为 0..2^32-1 的无符号整数）
-local function bxor(a, b)
-    local r = 0
-    for i = 0, 31 do
-        local ab = a % 2
-        local bb = b % 2
-        if ab ~= bb then
-            r = r + 2 ^ i
+-- 真机（LuaJIT）走 bit.bxor；Lua 5.2+ 走 bit32；都没有时用「半字节查表」
+-- 回退（8 次循环、无幂运算）。旧实现逐位循环 32 次且每轮算 2^i，
+-- 对 2MB 的 EPUB 内容要跑 2 亿次级运算，在 Kindle ARM 上会把转换拖到
+-- 分钟级 —— 这正是大 .docx 转换时进程被系统 Killed 的直接诱因。
+local bxor
+do
+    local ok1, bitlib = pcall(require, "bit")
+    if ok1 and type(bitlib) == "table" and type(bitlib.bxor) == "function" then
+        bxor = function(a, b) return bitlib.bxor(a, b) % 4294967296 end
+    else
+        local ok2, bit32 = pcall(require, "bit32")
+        if ok2 and type(bit32) == "table" and type(bit32.bxor) == "function" then
+            bxor = function(a, b) return bit32.bxor(a, b) % 4294967296 end
+        else
+            -- 纯 Lua 5.1 回退：预计算 16x16 半字节异或表，之后每次异或只需 8 轮
+            local xt = {}
+            for i = 0, 15 do
+                for j = 0, 15 do
+                    local r, a2, b2, mul = 0, i, j, 1
+                    for _ = 0, 3 do
+                        if a2 % 2 ~= b2 % 2 then r = r + mul end
+                        mul = mul * 2
+                        a2 = math.floor(a2 / 2)
+                        b2 = math.floor(b2 / 2)
+                    end
+                    xt[i * 16 + j + 1] = r
+                end
+            end
+            bxor = function(a, b)
+                local r, mul = 0, 1
+                for _ = 1, 8 do
+                    r = r + xt[(a % 16) * 16 + (b % 16) + 1] * mul
+                    mul = mul * 16
+                    a = math.floor(a / 16)
+                    b = math.floor(b / 16)
+                end
+                return r % 4294967296
+            end
         end
-        a = math.floor(a / 2)
-        b = math.floor(b / 2)
     end
-    return r
 end
 
 -- 小端 16 / 32 位写出
@@ -62,12 +90,16 @@ do
 end
 
 -- 计算字符串的 CRC-32（返回无符号 32 位整数）
+-- 热路径：每字节只做一次查表 + 最多两次异或；bxor 已换成 bit 库/查表实现，
+-- 避免旧版在 2MB 内容上产生上亿次逐位运算。
 local function crc32(data)
     local c = 0xFFFFFFFF
+    local ct = crc_table
+    local byte = string.byte
     for i = 1, #data do
-        local b = string.byte(data, i)
+        local b = byte(data, i)
         local idx = bxor(c % 256, b) % 256 + 1
-        c = bxor(math.floor(c / 256), crc_table[idx]) % 4294967296
+        c = bxor(math.floor(c / 256), ct[idx])
     end
     return bxor(c, 0xFFFFFFFF) % 4294967296
 end
@@ -697,6 +729,39 @@ local SPECIAL_TITLES = {
 -- “第一部”是卷名；“第一部门/部队/分队…”是正文，不是“部”章节
 local INVALID_VOLUME_SUFFIX = { ["门"] = true, ["队"] = true, ["属"] = true, ["分"] = true, ["件"] = true, ["落"] = true }
 
+-- 标题里的 Unicode 空白归一化为 ASCII 空格。
+-- Lua 的 %s 只认 ASCII 空白，而中文网文 / Word 标题普遍用 U+3000 全角空格
+-- （真机 big_novel.doc 的 363 个标题全是「第1章　章节标题1」这种写法）。
+-- 不归一化的话，chapterTitle 里「标记字之后必须是空白/标点」的校验会
+-- 把每一条标题都判成正文，DOM 兜底路径最终识别到 0 个标题、目录只剩 1 条。
+local function normalize_title_ws(s)
+    if not s or s == "" then return s or "" end
+    s = s:gsub("\227\128\128", " ")          -- U+3000 全角空格（E3 80 80）
+    s = s:gsub("\194\160", " ")              -- U+00A0 不换行空格
+    s = s:gsub("\226\128[\128-\138]", " ")   -- U+2000..U+200A 各类排版空格
+    s = s:gsub("\226\128\175", " ")          -- U+202F 窄不换行空格
+    s = s:gsub("\226\128\139", "")           -- U+200B 零宽空格
+    s = s:gsub("\239\187\191", "")           -- UTF-8 BOM
+    return s
+end
+
+-- 章节标记字之后的分隔符是否合法：ASCII 空白/标点 + 中文全角标点 +
+-- CJK 标点区（U+3000..U+303F）、全角标点区（U+FF00..U+FFFF）、
+-- 通用标点区（U+2010..U+203F，含中文破折号、引号）。
+-- 旧实现只检查 ^%s / ^%p，对「第1章：章节标题」「第1章（上）」也误判为正文。
+local function is_title_separator(rest)
+    if rest == "" then return true end
+    if rest:match("^[%s%p]") then return true end
+    local b1, b2, b3 = rest:byte(1, 3)
+    if not b1 then return true end
+    if b1 == 0xE3 and b2 == 0x80 then return true end                    -- U+3000..U+303F
+    if b1 == 0xEF and (b2 == 0xBC or b2 == 0xBD) then return true end    -- U+FF00..U+FFFF
+    if b1 == 0xE2 and b2 == 0x80 and b3 and b3 >= 0x90 and b3 <= 0xBF then
+        return true                                                       -- U+2010..U+203F
+    end
+    return false
+end
+
 -- 字符串是否为“数字型标记”（阿拉伯数字 / 罗马数字 / 中文数字）
 local function isNumberToken(value)
     value = value:gsub("%s+", "")
@@ -711,7 +776,7 @@ end
 
 -- 判断一行是否为章节标题（返回标题字符串或 nil）；参考 moon.koplugin/chapterTitle
 local function chapterTitle(line)
-    line = trim(line)
+    line = trim(normalize_title_ws(line or ""))
     -- 常见 TXT 用 === 包裹标题：仅剥离等号，避免吞掉正文
     line = line:gsub("^=+%s*", ""):gsub("%s*=+$", "")
     if line:match("^[Cc]hapter%s+[%w]+")
@@ -723,20 +788,22 @@ local function chapterTitle(line)
         for _i, marker in ipairs({ "章", "回", "节", "集", "幕", "卷", "部", "篇" }) do
             local number, suffix = line:match("^第%s*(.-)%s*" .. marker .. "(.*)$")
             if number and isNumberToken(number) then
-                -- 标记字之后必须是空白 / 标点（或行末），避免把“第二回的内容”这类正文行误判为标题
-                local ok_suffix = (suffix == "" or suffix:match("^%s") or suffix:match("^%p"))
-                -- “第一部门/部队”是正文，不是“第一部”章节
-                if ok_suffix and (marker ~= "部" or not INVALID_VOLUME_SUFFIX[suffix:sub(1, 3)]) then
+                local rest = suffix or ""
+                -- 标记字之后必须是空白 / 标点 / 行末，避免把“第二回的内容”
+                -- 这类正文行误判为标题；同时兼容全角空格与中文全角标点。
+                -- “第一部门/部队”是正文，不是“第一部”章节。
+                if is_title_separator(rest)
+                    and (marker ~= "部" or not INVALID_VOLUME_SUFFIX[rest:sub(1, 3)]) then
                     return line
                 end
             end
         end
     end
     for title in pairs(SPECIAL_TITLES) do
-        if line == title
-            or line:match("^" .. title .. "[%s:%-].+$")
-            or line:match("^" .. title .. "：.+$") then
-            return line
+        if line == title then return line end
+        if line:sub(1, #title) == title then
+            local rest = line:sub(#title + 1)
+            if rest ~= "" and is_title_separator(rest) then return line end
         end
     end
     return nil
@@ -1600,23 +1667,20 @@ end
 --   hooks    : { on_yield, on_progress }（同 build_epub_streaming）
 --   返回：true, count（EPUB 章节文件数）
 ------------------------------------------------------------------------
-function Converter.build_epub_from_docx(path, out_path, opts, hooks)
+-- 「段落序列 -> EPUB」统一流水线。
+--   .docx / .html / .htm / .md 先各自解析成同样的段落序列：
+--     { {kind="heading", level=N, text=T} | {kind="body", text=T}, ... }
+--   本函数负责聚合成章节、逐章写出、生成 nav/ncx/opf。
+--   逐段消费并即时置空，避免 7000+ 个 table 与全文字符串同时驻留 Lua 堆，
+--   在 Kindle 低内存设备上被 OOM killer 杀掉。
+function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, opts, hooks)
     opts = opts or {}
     local indent = opts.indent or "2em"
     local uid = opts.uid or ("urn:uuid:" .. Converter.gen_uid())
     local modified = opts.modified or os.date("!%Y-%m-%dT%H:%M:%SZ")
 
-    local ok, DocxReader = pcall(require, "docx")
-    if not ok or not DocxReader then
-        error("无法加载 docx 解析模块（docx.lua 缺失）")
-    end
-    local doc, derr = DocxReader.read(path)
-    if not doc then
-        error("读取 Word 文档失败：" .. tostring(derr))
-    end
-
-    local book_title = doc.title or opts.book_title or "未命名"
-    local paragraphs = doc.paragraphs or {}
+    paragraphs = paragraphs or {}
+    book_title = book_title or opts.book_title or "未命名"
 
     local zip = ZipWriter:new(out_path)
     zip:add("mimetype", "application/epub+zip")
@@ -1689,7 +1753,11 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
         seen_heading = true
     end
 
-    for _, p in ipairs(paragraphs) do
+    -- 数值 for + 逐段置空：处理完的段落立刻可被 GC 回收（ipairs 无法这样用）
+    local n_paras = #paragraphs
+    for idx = 1, n_paras do
+        local p = paragraphs[idx] or { kind = "body", text = "" }
+        paragraphs[idx] = nil
         if p.kind == "heading" then
             local title = (p.text and p.text ~= "") and p.text or ("（未命名标题 " .. (p.level or 1) .. "）")
             -- 首个标题若与书名相同（如 Word 的 Title 样式段落），视为书名，不单独成章
@@ -1715,7 +1783,9 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
                 end
             end
         end
+        if idx % 200 == 0 then collectgarbage("step") end
     end
+    paragraphs = nil
     if current then
         emit(current.title, current.paras, current.level)
     end
@@ -1737,6 +1807,55 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
     zip:close()
     collectgarbage("collect")
     return true, #toc
+end
+
+------------------------------------------------------------------------
+-- 9d-1a. Word(.docx) 入口：读 OOXML -> 段落序列 -> 统一流水线
+------------------------------------------------------------------------
+function Converter.build_epub_from_docx(path, out_path, opts, hooks)
+    local ok, DocxReader = pcall(require, "docx")
+    if not ok or not DocxReader then
+        error("无法加载 docx 解析模块（docx.lua 缺失）")
+    end
+    local doc, derr = DocxReader.read(path)
+    if not doc then
+        error("读取 Word 文档失败：" .. tostring(derr))
+    end
+    local book_title = doc.title or (opts and opts.book_title) or "未命名"
+    local paragraphs = doc.paragraphs or {}
+    doc.paragraphs = nil
+    doc = nil
+    collectgarbage("step")
+    return Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, opts, hooks)
+end
+
+------------------------------------------------------------------------
+-- 9d-1b. Markdown / HTML 入口：插件自解析，不依赖 KOReader DOM
+------------------------------------------------------------------------
+function Converter.build_epub_from_markup(path, out_path, opts, hooks)
+    local ok, M = pcall(require, "markup")
+    if not ok or not M then
+        error("无法加载标记文档解析模块（markup.lua 缺失）")
+    end
+    local f = io.open(path, "rb")
+    if not f then error("无法打开文件：" .. tostring(path)) end
+    local raw = f:read("*a") or ""
+    f:close()
+    local text = raw
+    if text:sub(1, 3) == "\239\187\191" then text = text:sub(4) end
+    if not is_valid_utf8(text) then
+        -- GBK / GB18030 的 .md/.html 也常见；落到临时文件解码，内存有界
+        local dec = decode_via_iconv(raw)
+        if dec then text = dec end
+    end
+    local ext = (path:match("%.([^%.]+)$") or ""):lower()
+    local kind = (ext == "md" or ext == "markdown") and "md" or "html"
+    local parsed = M.parse(text, kind) or {}
+    local book_title = parsed.title or (opts and opts.book_title) or "未命名"
+    local paragraphs = parsed.paragraphs or {}
+    text, raw, parsed = nil, nil, nil
+    collectgarbage("step")
+    return Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, opts, hooks)
 end
 
 ------------------------------------------------------------------------
@@ -1865,7 +1984,10 @@ end
 -- HTML 片段 -> 纯文本（去标签 + 实体解码 + 折叠空白），仅用于「标题判定」。
 -- 不用 utf8.char：真机 LuaJIT 无该库，且超范围码点在 Lua 5.3 上会抛错。
 local function html_block_text(frag)
-    local t = frag:gsub("<[^>]*>", "")
+    -- 保留原文（含 U+3000 全角空格）：归一化只在 chapterTitle 内部用于「判定」，
+    -- 若在这里先归一化，写进目录/标题的就会是改造过的文本，与原文不一致。
+    local t = frag
+    t = t:gsub("<[^>]*>", "")
     t = t:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
          :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
     local function cp(u)
@@ -1912,6 +2034,11 @@ local function html_to_blocks(html)
         elseif open_name then
             local ln = open_name:lower()
             if HEADING_LEVEL[ln] then pending_heading = HEADING_LEVEL[ln] end
+            -- cre 部分版本用 <br> / <br/> 分段（而非 </p>），必须也作为切点，
+            -- 否则整章会落成单个巨型文本块，标题判定因「长度 > 80」全部失效。
+            if ln == "br" then
+                cuts[#cuts + 1] = { e = e - 1, heading = nil }
+            end
         end
     end
     -- cre 偶尔返回纯文本 + 换行（无块标签）：按行兜底切分
@@ -1996,6 +2123,81 @@ local function resplit_chapters_by_heading(chapters, book_title)
     return (#out > 0) and out or nil, hits
 end
 
+-- 第二层兜底：DOM 的块级标签完全没识别出标题时（例如 cre 把整章压成单行
+-- 纯文本、或标签结构异常），把 HTML 转成纯文本行再识别标题并重建章节。
+-- 此路径退化为 <p> 段落（不保留原始 HTML 样式），但能保证「有目录 + 正文完整」，
+-- 优于只有 1 条目录的 256KB 硬切结果。
+local function html_to_plain_lines(html)
+    local s = sanitize_document_html(html or "")
+    s = s:gsub("<[Bb][Rr]%s*/?>", "\n")
+    -- 任意闭合标签都视为段落边界：cre 有时用 <span>/<font> 包裹段落而
+    -- 完全不出现 </p>，此时主路径切不出块，这一层仍能把标题逐行找出来。
+    s = s:gsub("</[^>]+>", "\n")
+    s = s:gsub("<[^>]*>", "")
+    -- 同上：不在此归一化 Unicode 空白，标题判定由 chapterTitle 内部完成，
+    -- 目录文本才能保留原文的全角空格。
+    s = s:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+         :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+    local function cp(u)
+        if not u or u ~= u or u < 0 or u > 0x10FFFF
+            or (u >= 0xD800 and u <= 0xDFFF) then
+            return "\239\191\189"
+        end
+        return codepoint_to_utf8(u)
+    end
+    s = s:gsub("&#x([%x]+);", function(h) return cp(tonumber(h, 16)) end)
+    s = s:gsub("&#(%d+);", function(d) return cp(tonumber(d, 10)) end)
+    return s
+end
+
+local function resplit_by_plain_text(chapters, book_title)
+    local all = {}
+    for _, ch in ipairs(chapters) do
+        if ch.raw_html and ch.raw_html ~= "" then all[#all + 1] = ch.raw_html end
+    end
+    if #all == 0 then return nil, 0 end
+    local plain = html_to_plain_lines(table.concat(all))
+    local lines = {}
+    for ln in plain:gmatch("[^\r\n]+") do
+        local t = trim(ln)
+        if t ~= "" then lines[#lines + 1] = t end
+    end
+    local function title_of(t)
+        if #t > 80 or not Converter.is_chapter_title(t) then return nil end
+        return t
+    end
+    local hits = 0
+    for _, t in ipairs(lines) do if title_of(t) then hits = hits + 1 end end
+    if hits < 2 then return nil, hits end
+
+    local out, cur, leading = {}, nil, {}
+    local function finish()
+        if cur then
+            cur.raw_html = table.concat(cur.parts)
+            cur.parts = nil
+            out[#out + 1] = cur
+            cur = nil
+        end
+    end
+    for _, t in ipairs(lines) do
+        if title_of(t) then
+            finish()
+            cur = { title = t, level = Converter.title_level(t), parts = {} }
+            for _, f in ipairs(leading) do cur.parts[#cur.parts + 1] = f end
+            leading = {}
+        else
+            local p = "<p>" .. escape_html(t) .. "</p>"
+            if cur then cur.parts[#cur.parts + 1] = p
+            else leading[#leading + 1] = p end
+        end
+    end
+    finish()
+    if #out == 0 and #leading > 0 then
+        out[1] = { title = book_title, level = 0, raw_html = table.concat(leading) }
+    end
+    return (#out > 0) and out or nil, hits
+end
+
 function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
     opts = opts or {}
     local indent = opts.indent or "2em"
@@ -2055,13 +2257,32 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
     --     按 256KB 硬切的大章，nav/ncx 只有 1 条目录且标题完全没有排版。
     --     只有「重切后章节数明显更多」才替换，避免破坏已有的完整 TOC。
     --------------------------------------------------------------------
-    local detected_titles, resplit = 0, false
+    -- 记录原始 DOM HTML 片段样本，供 .txt2epub.log 诊断真机渲染结构
+    local dom_html_sample = ""
+    for _, ch in ipairs(chapters) do
+        if ch.raw_html and ch.raw_html ~= "" then
+            dom_html_sample = ch.raw_html:sub(1, 160):gsub("[\r\n\t]", " ")
+            break
+        end
+    end
+
+    local detected_titles, resplit, resplit_mode = 0, false, "否"
     do
+        local toc_n0 = #toc
         local rebuilt, hits = resplit_chapters_by_heading(chapters, book_title)
         detected_titles = hits or 0
-        if rebuilt and #rebuilt > #chapters then
+        -- 无 TOC 时原有 chapters 只是按 256KB 硬切的产物，只要识别到 >=2 个
+        -- 标题就替换；已有完整 TOC 时仍要求「重切后章节更多」，避免破坏原结构。
+        if rebuilt and (toc_n0 == 0 or #rebuilt > #chapters) then
             chapters = rebuilt
-            resplit = true
+            resplit, resplit_mode = true, "标题重切"
+        else
+            local rebuilt2, hits2 = resplit_by_plain_text(chapters, book_title)
+            if rebuilt2 and (toc_n0 == 0 or #rebuilt2 > #chapters) then
+                chapters = rebuilt2
+                detected_titles = hits2
+                resplit, resplit_mode = true, "纯文本重建"
+            end
         end
     end
 
@@ -2082,6 +2303,8 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
         visible_chars = visible_chars,
         detected_titles = detected_titles,
         resplit = resplit,
+        resplit_mode = resplit_mode,
+        html_sample = dom_html_sample,
     }
     -- 让上层能在写盘前就能复用同一判定（也可用 opts.hooks 之外的独立函数）
     stats.empty = Converter.is_empty_document_result(stats)
@@ -2109,7 +2332,10 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
                 local px = Converter.build_chapter_xhtml_raw(t, seg, level)
                 local fname = string.format("OEBPS/chapter_%04d%s.xhtml", i, (part == 1) and "" or ("_" .. part))
                 zip:add(fname, px)
-                toc_meta[#toc_meta + 1] = { file = fname, title = t, level = level, toc = (part == 1) }
+                -- 每个硬切分片都进目录：真机 .doc 在标题识别失败时，旧实现
+                -- 只让第 1 片进 nav/ncx，结果全书只有 1 条目录。全部列入后
+                -- 至少可逐段跳转（标题为「书名（N）」）。
+                toc_meta[#toc_meta + 1] = { file = fname, title = t, level = level, toc = true }
                 part = part + 1
                 if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
                 if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end

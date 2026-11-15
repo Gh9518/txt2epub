@@ -2,6 +2,25 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.0（2026-11-15）
+### 修复：`.doc` 仍无目录、`.docx` 大文件崩溃；新增 Markdown / HTML 支持
+
+真机日志（`big_novel.doc`）：`可见正文 2204261 字符，TOC 条目 0，正文标题 0，重切分 否，章节 15`；随后转换 `big_novel_STORED.docx` 时 `crash.log` 只留 `Killed`，KOReader 被系统杀死、无 EPUB 产出。
+
+- **`.doc` 无目录的真因**：`big_novel.doc` 的 363 个标题全部用 **U+3000 全角空格**（`第1章　章节标题1`），`chapterTitle()` 的后缀校验只认 `^%s` / `^%p`（ASCII 空白/标点），导致**全部漏判 → 正文标题 0 → 不重切**；再加上硬切的 15 个分片只有第 1 片进 `nav/ncx`，最终只剩 1 条目录。
+  - 新增 `normalize_title_ws()`（全角空格 / NBSP / U+2000 系列 / 零宽空格）与 `is_title_separator()`（中文全角标点 `：` `（` 等），`.txt` 与 DOM 路径同时受益。
+  - 新增第二层「纯文本重建」兜底：DOM 无块级标签时把 HTML 转纯文本行再识别标题，退化成 `<p>` 但保证有目录；`html_to_blocks()` 增加 `<br>` 切点。
+  - **所有硬切分片都进目录**（不再只有第 1 片）；正文确实无标题时也能逐段跳转。
+  - 日志新增「重切分方式」「DOM HTML 样本（前 160 字节）」，`stats` 增加 `resplit_mode` / `html_sample`。
+- **`.docx` 被 `Killed` 的真因**：`crc32()` 每字节调用 3 次 `bxor()`，而旧 `bxor` 是**逐位 32 次循环 + `2^i` 幂运算**；2.8 MB 内容要跑上亿次级运算，在 Kindle ARM 上耗时分钟级并持续占用内存，被内核 OOM killer 杀死（无 Lua 堆栈）。
+  - `bxor` 改为优先 `bit.bxor`（LuaJIT 真机）/ `bit32.bxor`，否则用 16×16 半字节查表（8 次循环、无幂运算）；`crc32` 热路径精简。实测 2.8 MB STORED docx：LuaJIT **2.02 s → 0.36 s**、Lua 5.3 **14.82 s → 0.70 s**，EPUB 全部条目 CRC 仍正确。
+  - `DocxReader` 解析完立刻释放 ZIP 原始字节与 `document.xml`；`build_epub_from_paragraphs()` 逐段消费并置空、`collectgarbage("step")`，降低内存峰值。
+- **新增 `.md` / `.markdown` / `.html` / `.htm` 插件自解析**（`markup.lua`）：Markdown ATX/Setext 标题、代码块、列表、行内标记；HTML `<title>` 作书名、`<h1>`~`<h6>` 作多级标题，剥离 script/style、解码实体；UTF-8 与 GBK 均可。不依赖 KOReader 能否打开该格式。`.docx` 与新格式统一走 `build_epub_from_paragraphs()` 流水线。
+- **发布包改为含顶层目录** `txt2epub.koplugin/`：解压即得插件目录，直接拷入 `plugins/` 即可，无需手动建目录。插件文件由 7 个增至 **8 个**（新增 `markup.lua`）。
+- **测试样本**：新增 `big_novel.txt`（2.2 MB，3 卷/300 章/60 节、标题含全角空格），并附 `big_novel.md` / `big_novel.html`；生成脚本 `test/fixtures/gen_txt_big.py`。
+- **更名方案**：README 新增「七、更名方案」，主推 `doc2epub.koplugin`（仓库 `doc2epub`、菜单 `Doc2EPUB`），列出全部需同步项；本轮按需求保持现名与安装路径不变。
+- **验证**：新增 `test_dom_unicode.lua`（42 项，完整复现真机 363 标题全角空格场景）、`test_markup.lua`（40 项）；真机日志场景从「正文标题 0 / 章节 15」变为「**正文标题 363 / 章节 363 / 363 条目录**，耗时 0.7 s」。全套 **488 项 × Lua 5.3 / LuaJIT 双解释器通过、0 失败**（17 套件）。
+
 ## v2.0.1（2026-11-15）
 ### 修复：大文件 `.doc` 转换「有正文、无目录、目录没排版」
 

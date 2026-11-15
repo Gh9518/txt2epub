@@ -1,34 +1,35 @@
-# txt2epub —— KOReader 插件：TXT / Word 等一键转 EPUB
+# txt2epub —— KOReader 插件：TXT / Word / Markdown / HTML 一键转 EPUB
 
-在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成**同名的 `.epub`**，保存在原文件同一目录。**无需区分格式、无需另存为**——插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 由插件**直接解析 OOXML**（Word 标题样式 → 多级目录 + 完整正文，最完整）；`.doc`/RTF/FB2/EPUB/HTML 等由 KOReader 已打开的文档内容兜底转换。生成的 EPUB 带有可跳转的**多级章节目录**（同时兼容 EPUB3 `nav.xhtml` 与 EPUB2 `toc.ncx`），并内置借鉴开源项目的排版精修。
+在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成**同名的 `.epub`**，保存在原文件同一目录。插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 直接解析 OOXML；`.html` / `.htm` / `.md` 由 `markup.lua` 直接解析源文件；`.doc` / RTF / FB2 / EPUB 等由 KOReader 已打开的文档内容兜底。生成的 EPUB 带有可跳转的**多级章节目录**（EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`）与内置排版精修。
 
-> 借鉴的开源项目与具体代码，见文末「致谢与开源借鉴」。
+> 借鉴的开源项目与具体代码，见文末「致谢与开源借鉴」。命名建议见「七、更名方案」。
 
 ---
 
 ## English Overview
 
-**txt2epub** is a KOReader plugin that converts the currently opened document into a polished `.epub` with **one tap** (menu **Tools › TXT2EPUB**). **No format juggling, no "save as"** — the plugin picks the most reliable path automatically: `.txt` uses title/indent detection; `.docx` is parsed **directly from OOXML** by the plugin (Word heading styles → multi-level TOC + full text, the most complete result); `.doc`/RTF/FB2/EPUB/HTML fall back to the document KOReader already opened. The result ships with a real multi-level TOC (both EPUB3 `nav.xhtml` and EPUB2 `toc.ncx`, recognized by KOReader) and typography presets inspired by other open-source KOReader plugins.
+**txt2epub** is a KOReader plugin that converts a document into a polished `.epub` with **one tap** (menu **Tools › TXT2EPUB**). It picks the most reliable path automatically: `.txt` uses title/indent detection; `.docx` is parsed **directly from OOXML**; `.html`/`.htm`/`.md` are parsed by the plugin's own `markup.lua`; `.doc`/RTF/FB2/EPUB fall back to the document KOReader already opened. The result ships with a real multi-level TOC (both EPUB3 `nav.xhtml` and EPUB2 `toc.ncx`) and typography presets inspired by other open-source KOReader plugins.
 
 ### Highlights
-- **One-tap, any format (v2.0.0)** — `.txt` and `.docx` are parsed by the plugin itself (reliable, full TOC + text); other reader-supported formats (`.doc`/RTF/FB2/EPUB/HTML) use KOReader's parsed document as a fallback, with an empty-result guard instead of silently producing an empty book.
-- **TOC rebuilt from body (v2.0.1)** — when KOReader returns **no TOC** for `.doc`/RTF/FB2 (Word heading styles become plain `<p>`), the plugin detects chapter headings in the extracted body text and rebuilds a real nested TOC + styled `<h1>` headings, instead of one giant 256 KB-split chapter with a single meaningless entry.
+- **One-tap, many formats** — `.txt`, `.docx`, `.html`, `.htm`, `.md` are parsed by the plugin itself (no dependency on KOReader's parser); other reader-supported formats use KOReader's parsed document as a fallback, with an empty-result guard instead of silently producing an empty book.
+- **TOC rebuilt from body (v2.0.1+)** — when KOReader returns **no TOC** for `.doc`/RTF/FB2 (Word heading styles become plain `<p>`), the plugin detects chapter headings in the extracted body and rebuilds a nested TOC + styled `<h1>` headings. **v2.1.0** also handles U+3000 full-width spaces (`第1章　标题`) and Chinese punctuation, and falls back to a plain-text rebuild when the DOM has no block tags at all.
+- **Fast, low-memory build (v2.1.0)** — CRC-32 now uses the LuaJIT `bit` library (table-based fallback elsewhere); a 2.8 MB `.docx` converts in ~0.4 s instead of minutes, and ZIP/EPUB buffers are released eagerly. This fixes the `Killed` (OOM) crash on Kindle.
 - **Multi-level TOC** — auto-detects 卷/部/册/篇 → 章/回 → 节/集/幕 instead of a flat list.
 - **Typography presets** (Compact / Standard / Relaxed / Custom) baked into `style.css` at conversion time — no resident hooks, zero runtime memory cost.
-- **Streaming, low-memory build** — writes the EPUB chapter-by-chapter and never pre-scans the whole book, so it won't be OOM-killed on memory-tight devices like Kindle.
-- **Local font selection** — pick any installed font (name shown in your UI language) or type a name as fallback.
-- **Large-chapter splitting** — splits XHTML chapters larger than 256 KB.
+- **Local font selection** — pick any installed font (name shown in your UI language) or type a name.
+- **Large-chapter splitting** — splits XHTML chapters larger than 256 KB; every split part gets its own TOC entry.
 
 ### Install
-1. Copy `txt2epub.koplugin/` into KOReader's `plugins/` directory (e.g. `koreader/plugins/`, or `Android/data/org.koreader.ko_reader/files/plugins/` on Android).
-2. Fully quit and restart KOReader.
-3. Open any supported document (`.txt`, Word `.doc`/`.docx`, RTF, FB2, EPUB, HTML) → **Tools › TXT2EPUB**.
+1. Unzip the release archive — it contains a single top-level folder `txt2epub.koplugin/`.
+2. Copy that whole folder into KOReader's `plugins/` directory (e.g. `koreader/plugins/`, or `Android/data/org.koreader.ko_reader/files/plugins/` on Android).
+3. Fully quit and restart KOReader.
+4. Open any supported document → **Tools › TXT2EPUB › 开始转换**.
 
 ---
 
 ## 一、安装
 
-把整个 `txt2epub.koplugin` 目录复制到 KOReader 的插件目录，再**完全退出并重启** KOReader：
+发布包解压后**直接得到一个 `txt2epub.koplugin/` 目录**，把它整个复制到 KOReader 的插件目录，再**完全退出并重启** KOReader：
 
 | 设备 | 路径 |
 | --- | --- |
@@ -36,25 +37,33 @@
 | Android | `Android/data/org.koreader.ko_reader/files/plugins/` |
 | 桌面版 | KOReader 安装目录下的 `plugins/` |
 
-插件目录需包含**全部文件**（勿遗漏）：`_meta.lua`、`main.lua`、`converter.lua`、`docx.lua`（Word 解析）、`inflate.lua`（raw DEFLATE 解压）、`README.md`、`CHANGELOG.md`。其中 `docx.lua` / `inflate.lua` 为 `.docx` 转换必需，缺失会报「无法加载 docx/inflate 模块」。重启后打开任意文档，「工具」菜单下应出现「TXT2EPUB」。
+插件目录需包含**全部 8 个文件**（勿遗漏）：`_meta.lua`、`main.lua`、`converter.lua`、`docx.lua`（Word 解析）、`inflate.lua`（raw DEFLATE 解压）、`markup.lua`（Markdown/HTML 解析）、`README.md`、`CHANGELOG.md`。其中 `docx.lua` / `inflate.lua` 为 `.docx` 必需，`markup.lua` 为 `.md`/`.html`/`.htm` 必需；缺失会明确报「无法加载 xxx 模块」，不会静默失败。重启后打开任意文档，「工具」菜单下应出现「TXT2EPUB」。
 
 ---
 
 ## 二、使用
 
-1. 在 KOReader 打开任意受支持的文档（`.txt` / Word `.doc`·`.docx` / RTF / FB2 / EPUB / HTML）。
-2. 点「**工具 › TXT2EPUB › 开始转换**」（按钮始终可点；无法判定源文件时会弹文件选择器让你点选；输出已存在会询问是否覆盖）。
+1. 在 KOReader 打开任意受支持的文档，或从菜单里的文件选择器直接选文件。
+2. 点「**工具 › TXT2EPUB › 开始转换**」（按钮始终可点；无法判定源文件时会弹文件选择器；输出已存在会询问是否覆盖）。
 3. 可在「**排版预设…**」里先选「紧凑 / 标准 / 宽松大字」一键套用排版风格。
-4. 插件按章节标题自动切分正文，生成带多级目录与排版精修的 EPUB，转换完成后弹「✓ 转换完成：共 N 章」。
+4. 插件按章节标题自动切分正文，生成带多级目录与排版精修的 EPUB，完成后弹「✓ 转换完成：共 N 章」。
 5. 用 KOReader 打开生成的 `.epub` 即可通过目录面板跳转。
 
-**转换进度**：先显示「正在识别章节…」做标题预检，再显示「正在写入…+进度条+已写入 N 章」；全程常驻进度框，完成即自动关闭并弹出完成提示。诊断日志写在**源文件同目录**的隐藏文件 `.txt2epub.log`（日志为隐藏文件，需在文件管理器开启「显示隐藏文件」；每次转换追加写入，超 512 KB 自动清空重建）。
+| 扩展名 | 转换方式 | 目录来源 |
+| --- | --- | --- |
+| `.txt` | 插件自解析（流式按行） | 章节标题正则 / 空格缩进 |
+| `.docx` | 插件自解析 OOXML | Word 标题样式（Heading1/2/3… 与 Title） |
+| `.md` / `.markdown` | 插件自解析 `markup.lua` | `#` ~ `######`、Setext 标题 |
+| `.html` / `.htm` | 插件自解析 `markup.lua` | `<title>` 作书名、`<h1>`~`<h6>` 作多级标题 |
+| `.doc` / RTF / FB2 / EPUB | KOReader 已打开文档的 DOM 兜底 | 优先用 `getToc()`；为 0 时从正文识别标题重切分 |
+
+**转换进度**：先显示「正在识别章节…」，再显示「正在写入… + 进度条 + 已写入 N 章」；全程常驻进度框，完成即自动关闭。诊断日志写在**源文件同目录**的隐藏文件 `.txt2epub.log`（需在文件管理器开启「显示隐藏文件」；每次转换追加写入，超 512 KB 自动清空重建）。日志含「TOC 条目 / 正文标题数 / 重切分方式 / DOM HTML 样本（前 160 字节）」，便于定位真机差异。
 
 ### 设置（可选）
-- **排版预设**：紧凑 / 标准 / 宽松大字 / 自定义；「自定义参数…」逐项微调行高·段距·首行缩进·字号缩放·字距·两端对齐（选项列表点选，即时保存）；「正文字体…」从本机字体列表预览选择（中文字体显示中文名+样式，英文显示英文名）。
+- **排版预设**：紧凑 / 标准 / 宽松大字 / 自定义；「自定义参数…」逐项微调行高·段距·首行缩进·字号缩放·字距·两端对齐；「正文字体…」从本机字体列表预览选择（中文字体显示中文名+样式，英文显示英文名）。
 - **章节标题正则**：可填一条 Lua 模式覆盖默认识别规则，附「示例」按钮；「恢复默认正则」复位。
-- 默认支持的标题写法：`第一章` / `第1章` / `第一回` / `卷一 少年游` / `楔子` / `番外` / `后记` / `序章` / `Chapter 1` 等。
-- **无标题时按空格缩进识别层级**：若文档无显式章节标题，可弹窗选择「按缩进切分」（每行前导空格数决定层级，步长可在设置里改）、「整本作一章」或「取消」。
+- 默认支持的标题写法：`第一章` / `第1章` / `第一回` / `卷一 少年游` / `楔子` / `番外` / `后记` / `序章` / `Chapter 1` 等；**v2.1.0 起兼容全角空格与中文全角标点**（`第1章　标题`、`第1章：标题`、`第1章（上）`）。
+- **无标题时按空格缩进识别层级**：若文档无显式章节标题，可弹窗选择「按缩进切分」「整本作一章」或「取消」。
 
 ---
 
@@ -63,11 +72,13 @@
 - **多级目录**：卷/部/册/篇 → 章/回 → 节/集/幕 三级嵌套，生成真正的 EPUB3 `nav.xhtml` 与 EPUB2 `toc.ncx`。
 - **排版预设**：紧凑（行距130%）/ 标准（默认，行距155%＋段距0.3em＋首行缩进2字）/ 宽松大字（行距185%＋字号115%）/ 自定义，转换时烘焙进 `style.css`，不装常驻钩子。
 - **本地字体**：列出本机全部已安装字体，菜单按界面语言显示中文名/英文名及样式（粗体·斜体）。
-- **Word 文档**：直接打开 `.docx` 亦可一键转换（菜单同为「工具 › TXT2EPUB」）。章节层级取自 Word 的标题样式（Heading1/2/3… 与 Title），自动生成多级目录、完整正文；插件用纯 Lua 直接解析 OOXML，STORED 与压缩（DEFLATE）docx 均支持，不依赖设备 zlib。旧版 `.doc` 等其它格式由 KOReader 已打开的文档内容兜底转换；**v2.0.1 起**即使 KOReader 未返回目录，也会从正文识别「第一卷 / 第X章 / 第X节」等标题，重切章节并生成嵌套目录与居中标题排版。
-- **超大章节切分**：单章 XHTML 超过 256 KB 自动切分。
+- **Word 文档**：`.docx` 由纯 Lua 直接解析 OOXML，STORED 与 DEFLATE 均支持，不依赖设备 zlib；标题样式 → 多级目录 + 完整正文。旧版 `.doc` 走 DOM 兜底，即使 `getToc()` 返回 0 条也会从正文识别标题重切分。
+- **Markdown / HTML**：`.md` / `.html` / `.htm` 由插件直接读磁盘解析，不依赖 KOReader 是否支持该格式；支持 ATX/Setext 标题、`<h1>`~`<h6>`、代码块、列表、引用、行内标记与 XML 实体，UTF-8 与 GBK 编码均可。
+- **超大章节切分**：单章 XHTML 超过 256 KB 自动切分；**每个分片都有目录条目**，不会再出现「整本书只有 1 条目录」。
+- **低内存**：CRC-32 走 LuaJIT `bit`（其余环境查表回退），ZIP 写完即释放，逐段消费段落序列；Kindle 等低内存设备上不再因分钟级纯 Lua 运算被系统 `Killed`。
 - **墨水屏友好**：`word-break`、`orphans/widows: 2`、`page-break-after: avoid` 等。
 - **稳健识别（借鉴 moon）**：中文数字校验 + 特例标题 + 误判过滤 + 段落回流合并。
-- **纯 Lua 实现**：内置最小 ZIP 写入器（Store 方式，符合 EPUB 规范），不依赖任何第三方库或系统命令；流式按行读写，内存有界。
+- **纯 Lua 实现**：内置最小 ZIP 写入器（Store 方式，符合 EPUB 规范），不依赖任何第三方库；流式按行读写，内存有界。
 
 ---
 
@@ -90,9 +101,11 @@
 
 - 非常规章节写法（如纯日期、自定义符号）需通过「设置章节标题正则」补充 Lua 模式。
 - 纯 Lua Store 方式不压缩，EPUB 体积偏大（兼容性最好）。
-- 缩进模式把每行非空行都当作目录条目，最适合"目录/大纲式"TXT；混有大段散文时建议用显式章节标题或自定义正则。
-- `.doc` / RTF / FB2 / EPUB / HTML 走 **KOReader 已打开文档的 DOM 兜底**。KOReader 常把 Word 标题样式渲染成普通 `<p>`、`getToc()` 返回 0 条；**v2.0.1 起插件会自行从正文识别章节标题重切分**，仍能得到多级目录。识别规则与 TXT 路径一致（默认「第X章 / 第X卷 / 第X节」等），可用「章节标题正则」补充；若正文里确实没有任何可识别标题，则退化为按 256 KB 切分、目录仅 1 条。若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」——`.docx` 由插件直接解析 OOXML，结果最完整、最稳定。
-- 旧版 `.doc` 等 DOM 兜底格式的**渲染 HTML 由 KOReader 引擎生成**，沙箱内只能用贴近真机的 mock 验证适配层与重切分逻辑，无法完整复现引擎输出，请以设备实测为准。诊断日志 `.txt2epub.log` 会记录「TOC 条目数 / 正文标题数 / 是否重切分」，便于定位。
+- 缩进模式把每行非空行都当作目录条目，最适合「目录/大纲式」TXT；混有大段散文时建议用显式章节标题或自定义正则。
+- `.doc` / RTF / FB2 / EPUB 走 **KOReader 已打开文档的 DOM 兜底**：`getToc()` 常为 0 条，插件会从正文识别「第一卷 / 第X章 / 第X节」重切分（v2.1.0 已兼容全角空格与中文标点），并有第二层「纯文本重建」兜底；若正文里确实没有任何可识别标题，则退化为按 256 KB 切分，但**每个分片都会列入目录**，仍可逐段跳转。若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」。
+- DOM 兜底格式的**渲染 HTML 由 KOReader 引擎生成**，沙箱内用贴近真机的 mock 验证适配层与重切分逻辑，无法完整复现引擎输出，请以设备实测为准。日志里的「DOM HTML 样本」可用于核对实际结构。
+- `.html`/`.htm`/`.md` 由插件自解析，但只保留文本与标题层级：图片、复杂表格、CSS 布局不会还原（行内粗体/斜体/链接会转成纯文本）。
+- 非 UTF-8 的 `.md`/`.html` 依赖系统 `iconv` 做 GBK→UTF-8 解码；设备无 `iconv` 时按原始字节处理，可能乱码但不崩溃。
 
 ---
 
@@ -101,8 +114,30 @@
 详细的崩溃修复与版本变更见 **[CHANGELOG.md](CHANGELOG.md)**。常见问题速查：
 
 - **菜单不显示**（甚至其它插件也消失）：确认目录名为 `txt2epub.koplugin` 且位于 `plugins/`。若所有插件菜单都消失，通常是某插件的 `addToMainMenu` 抛错导致 `MenuSorter` 合并失败——本插件用标准 `sorting_hint = "tools"` 写法，不会触碰内置菜单结构。
-- **点转换后崩溃/重启**：多为低内存或 UI 阻塞所致，已通过流式写盘、协程逐章 yield、超大章切分（含单段超长拆分）、移除目录遍历等彻底修复（详见 CHANGELOG）。
-- **排查日志**：优先发**源文件同目录的隐藏文件 `.txt2epub.log`**（含时间戳、源类型、逐章进度、含完整 Lua 错误栈的失败信息）；转换失败时屏幕弹窗里的 `转换失败：…` 也带错误栈，可直接截图。`crash.log` / `koreader.log`（KOReader 安装目录下）用于区分插件问题与原生固件/内存问题。
+- **无目录 / 只有 1 条目录**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
+- **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。
+- **排查日志**：优先发**源文件同目录的隐藏文件 `.txt2epub.log`**（含时间戳、源类型、逐章进度、体检字段、完整 Lua 错误栈）；`crash.log` / `koreader.log`（KOReader 安装目录下）用于区分插件问题与原生固件/内存问题。
+
+---
+
+## 七、更名方案（便于发布）
+
+插件已从「TXT → EPUB」扩展为 **TXT / Word / Markdown / HTML / 阅读器文档 → EPUB**，原名 `txt2epub` 已明显低估能力，不利于社区检索与收录。**推荐主方案**：
+
+| 项目 | 现名 | 建议改为 |
+| --- | --- | --- |
+| 插件目录 / 包名 | `txt2epub.koplugin` | **`doc2epub.koplugin`** |
+| GitHub 仓库 | `Gh9518/txt2epub` | `Gh9518/doc2epub`（用 GitHub rename，旧链接自动重定向） |
+| 菜单显示名 | `TXT2EPUB` | `Doc2EPUB`（中文界面可写「文档转 EPUB」） |
+| `_meta.lua` | `fullname = "TXT2EPUB"` | `fullname = "Doc2EPUB — 文档转 EPUB"` |
+| Release / 附件 | `v2.1.0` + `txt2epub.koplugin.zip` | `v3.0.0` + `doc2epub.koplugin.zip` |
+| 一句话简介 | 「TXT 排版助手」 | 「把 TXT/Word/Markdown/HTML 等文档转成带多级目录的 EPUB」 |
+
+**备选名**：`any2epub.koplugin`（强调多格式）、`text2epub.koplugin`（比 txt 宽但仍偏文本）、`epubforge.koplugin`（品牌感强、可注册性好，但不直观）。
+
+**改名需同步的清单**：插件目录名、`_meta.lua` 的 `fullname`、`main.lua` 的 `name` / `menu_items` key、7 个 `G_reader_settings` 键（`txt2epub_pattern` / `_indent` / `_indent_step` / `_style` / `_custom_style` / `_font`，建议加一次性迁移读取旧键）、README/CHANGELOG/测试说明里的路径与文件名、`.gitignore`、`Awesome KOReader` PR #45 的条目、Release 附件名与安装说明。诊断日志 `.txt2epub.log` 可保留原名，避免用户已积累的排查记录断开。
+
+**本轮决策**：按需求保持 `txt2epub.koplugin/` 目录名与现有仓库不变（发布包解压即得到该目录，安装路径零变化），**只提供方案、不强制执行改名**，避免破坏已安装用户、旧下载链接与已提交的社区收录条目。建议在下一个主版本 v3.0.0 一次性切换，并在 Release 说明里写清「旧目录请删除、设置会自动迁移」。
 
 ---
 
