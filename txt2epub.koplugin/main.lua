@@ -53,9 +53,11 @@ function TXT2EPUB:addToMainMenu(menu_items)
                 callback = function()
                     self:convert()
                 end,
-                enabled_func = function()
-                    return self:is_supported_file()
-                end,
+                -- 注意：旧实现用 enabled_func 判断“当前文档是否为 .txt/.docx”，
+                -- 一旦判断为否，TouchMenu 会把本项置灰且不可点击，且【没有任何提示】，
+                -- 用户完全不知道为什么点不了、也不知道当前文件被识别成了什么 —— 即本次“按钮变灰”的根因。
+                -- 改为：按钮始终可点，真正的类型校验放到 convert() 内，并在不支持时给出明确提示
+                -- （含当前识别到的扩展名），让用户能立刻定位问题。
             },
             {
                 text = _("排版预设…"),
@@ -104,22 +106,29 @@ function TXT2EPUB:is_txt_file()
     return self:file_ext() == ".txt"
 end
 
--- 支持的源文件：TXT 与 Word(.docx)。旧版 .doc（二进制 OLE2）暂不支持。
+-- 是否为 Word(.docx) 源文件（插件可自解析）。
+-- 2.0.0：.doc（二进制 OLE2）与 .rtf/.fb2/epub/html 等由通用 DOM 流程兜底，
+-- 不再属于"不支持"，故此类判断仅用于自解析分支的识别，不再用于置灰菜单项。
 function TXT2EPUB:is_docx_file()
     return self:file_ext() == ".docx"
 end
 
--- 取得当前文档的扩展名（小写，含点），如 ".txt" / ".docx" / ".doc"
-function TXT2EPUB:file_ext()
-    local file = self.ui and self.ui.document and self.ui.document.file
-    if not file or file == "" then return nil end
+-- 取得文件扩展名（小写，含点），如 ".txt" / ".docx" / ".doc"
+-- 优先使用传入的 file；未传则取当前已打开文档的路径。
+-- 分派决策见 convert()：.txt/.docx 走插件自解析（读磁盘源路径，可靠），
+-- 其余格式走通用 DOM 兜底。文件选择器仅在"完全没有已打开文档"时启用。
+function TXT2EPUB:file_ext(file)
+    file = file or self:_current_file()
+    if not file or type(file) ~= "string" or file == "" then return nil end
     local e = string.lower(file:match("%.([^%.]+)$") or "")
     if e == "" then return nil end
     return "." .. e
 end
 
-function TXT2EPUB:is_supported_file()
-    return self:is_txt_file() or self:is_docx_file()
+-- 当前已打开文档的路径（容错：ui/document 未就绪时返回 nil）
+function TXT2EPUB:_current_file()
+    local ok, doc = pcall(function() return self.ui and self.ui.document end)
+    return ok and doc and doc.file or nil
 end
 
 ------------------------------------------------------------------------
@@ -802,28 +811,358 @@ function TXT2EPUB:_safe(fn, ctx)
     return true
 end
 
-function TXT2EPUB:convert()
-    local file = self.ui and self.ui.document and self.ui.document.file
-    if not file then
-        UIManager:show(InfoMessage:new{ text = _("请先打开 TXT 或 Word(.docx) 文档") })
+------------------------------------------------------------------------
+-- 文件选择器：直接用文件浏览器点选磁盘上的 .txt / .docx 源文件
+-- 这是 DOCX 转换的可靠入口 —— KOReader 打开 DOCX 后 document.file 不一定指向
+-- 原始 .docx 路径，故不依赖打开的文档对象，改由用户显式选择源文件。
+------------------------------------------------------------------------
+function TXT2EPUB:pick_and_convert(start_path)
+    local lfs = require("libs/libkoreader-lfs")
+    local Screen = require("device").screen
+    local Menu = require("ui/widget/menu")
+
+    local path = self:_normalize_dir(start_path or self:_start_dir())
+    local items = self:_list_sources(path)
+
+    local picker = Menu:new{
+        title = _("选择要转换的文件（.txt / .doc / .docx / .rtf / .fb2 / .html / .epub）") .. "\n" .. path,
+        item_table = items,
+        is_popout = false,
+        is_borderless = false,
+        width = math.floor(Screen:getWidth() * 0.92),
+        height = math.floor(Screen:getHeight() * 0.85),
+        callback = function(item)
+            if not item or not item.path then return end
+            UIManager:close(picker)
+            if item.is_dir then
+                -- 进入子目录 / 返回上级
+                self:pick_and_convert(item.path)
+            else
+                -- 选中源文件，交给 convert() 处理（此时 ext 必为 .txt/.docx）
+                self:convert(item.path)
+            end
+        end,
+    }
+    UIManager:show(picker)
+end
+
+-- 选择器起始目录：若当前打开的是真实 .txt/.docx 则用它所在目录；
+-- 否则回退到 KOReader 主页目录 / 当前工作目录，避免落在 KOReader 内部临时目录。
+function TXT2EPUB:_start_dir()
+    local lfs = require("libs/libkoreader-lfs")
+    local cur = self:_current_file()
+    if cur then
+        local e = self:file_ext(cur)
+        if e == ".txt" or e == ".docx" then
+            local d = cur:match("(.*)/") or cur:match("(.*)\\")
+            if d and lfs.attributes(d, "mode") == "directory" then return d end
+        end
+    end
+    if G_reader_settings then
+        local h = G_reader_settings:readSetting("home_dir")
+        if h and lfs.attributes(h, "mode") == "directory" then return h end
+    end
+    return lfs.currentdir() or "/"
+end
+
+-- 规整目录路径：统一斜杠、校验存在性，不存在则回退
+function TXT2EPUB:_normalize_dir(p)
+    local lfs = require("libs/libkoreader-lfs")
+    if not p or p == "" then return lfs.currentdir() or "/" end
+    p = p:gsub("\\", "/")
+    if lfs.attributes(p, "mode") ~= "directory" then
+        return lfs.currentdir() or "/"
+    end
+    return p
+end
+
+-- 列出目录内可选项：父目录“..”、子目录、以及 .txt/.docx 文件；目录在前、文件在后
+function TXT2EPUB:_list_sources(path)
+    local lfs = require("libs/libkoreader-lfs")
+    local items = {}
+    if path ~= "/" then
+        table.insert(items, { text = "⬆ ..", path = self:_parent(path), is_dir = true })
+    end
+    local ok, iter, dir_obj = pcall(lfs.dir, path)
+    if ok then
+        for f in iter, dir_obj do
+            if f ~= "." and f ~= ".." then
+                local full = path .. "/" .. f
+                local attr = lfs.attributes(full) or {}
+                if attr.mode == "directory" then
+                    table.insert(items, { text = f .. "/", path = full, is_dir = true })
+                elseif attr.mode == "file" then
+                    local e = string.lower(f:match("%.([^%.]+)$") or "")
+                    -- 文件选择器主要服务于 .txt；其它格式建议在阅读器内直接打开后转换
+                    if e == "txt" or e == "doc" or e == "docx" or e == "rtf"
+                        or e == "fb2" or e == "html" or e == "htm" or e == "epub" then
+                        table.insert(items, { text = f, path = full, is_dir = false })
+                    end
+                end
+            end
+        end
+    end
+    table.sort(items, function(a, b)
+        if a.is_dir ~= b.is_dir then return a.is_dir end
+        return a.text:lower() < b.text:lower()
+    end)
+    if #items == 0 then
+        table.insert(items, { text = _("（此目录没有可选择的文件；其它格式请在阅读器内打开后转换）"), path = nil, is_dir = false })
+    end
+    return items
+end
+
+function TXT2EPUB:_parent(path)
+    local p = path:gsub("/$", "")
+    local d = p:match("(.*)/")
+    return d or "/"
+end
+
+------------------------------------------------------------------------
+-- 通用文档转换（2.0.0）：直接利用 KOReader 已打开文档的 DOM（TOC + 渲染 HTML）
+--   不区分 .doc / .docx / .rtf / .fb2 / .epub / .html —— KOReader 已替我们完成
+--   格式解析，我们只需把它的“已转换结果”再打包成 EPUB。
+------------------------------------------------------------------------
+
+-- 从真实 KOReader 文档对象适配出 converter 需要的抽象接口（doc_api）。
+-- 所有 KOReader 专属调用都收敛在这里，并用 pcall 守护，确保任一接口缺失都不会 panic。
+function TXT2EPUB:_build_doc_api(doc)
+    local doc_api = { title = nil, author = nil, toc = {}, page_count = 0,
+                      get_html = nil, get_page_xp = nil, end_xp = nil }
+
+    -- 书名 / 作者（CreDocument 等支持 getProps）
+    local ok, props = pcall(function() return doc:getProps() end)
+    if ok and type(props) == "table" then
+        doc_api.title = props.title or nil
+        doc_api.author = props.authors or nil
+    end
+
+    -- 页数（先取，后面换算「文档末尾 xpointer」要用）
+    pcall(function()
+        local pc = (doc.info and doc.info.number_of_pages) or 0
+        if pc == 0 and type(doc.getPageCount) == "function" then pc = doc:getPageCount() end
+        doc_api.page_count = pc or 0
+    end)
+
+    -- 目录：KOReader 真实 TOC 条目字段是
+    --   title(标题) / page(页码) / depth(层级) / xpointer(章节起点 xpointer)
+    -- （见 readertoc.lua：v.title、v.depth、v.page、v.xpointer）。
+    -- 早期实现误按 text / pos0 / pos1 读取 —— 真机上 pos0 恒为 nil，
+    -- build_epub_from_document 会跳过全部条目，最终只落进「空书体检」提示，
+    -- 使 .doc/.rtf/.fb2/.epub/.html 等兜底格式在真机上一个都转不出来。
+    -- 这里同时兼容新旧字段名；没有 xpointer 时用页码经 getPageXPointer 换算。
+    local toc
+    pcall(function()
+        if type(doc.getToc) == "function" then toc = doc:getToc() end
+        if toc == nil and type(doc.getTOC) == "function" then toc = doc:getTOC() end
+    end)
+    if type(toc) == "table" then
+        for _, e in ipairs(toc) do
+            if type(e) == "table" then
+                local xp = e.xpointer or e.pos0
+                if (not xp or xp == "") and (e.page or e.pageno)
+                    and type(doc.getPageXPointer) == "function" then
+                    local okx, x = pcall(doc.getPageXPointer, doc, e.page or e.pageno)
+                    if okx and x and x ~= "" then xp = x end
+                end
+                doc_api.toc[#doc_api.toc + 1] = {
+                    text = e.title or e.text,
+                    depth = e.depth or 1,
+                    pos0 = xp,
+                    pos1 = e.pos1,
+                }
+            end
+        end
+    end
+
+    -- 文档末尾 xpointer：末章区间 [pos0, end_xp) 才能覆盖到全书结尾。
+    -- 依次尝试 页数+1（末尾边界）/ 最后一页 / 倒数第二页，取第一个有效值。
+    local function resolve_end_xp()
+        if type(doc.getPageXPointer) ~= "function" then return nil end
+        local pc = doc_api.page_count or 0
+        local candidates = { pc + 1, pc, (pc > 1) and (pc - 1) or nil }
+        for _, p in ipairs(candidates) do
+            if p and p > 0 then
+                local okx, x = pcall(doc.getPageXPointer, doc, p)
+                if okx and x and x ~= "" then return x end
+            end
+        end
+        return nil
+    end
+    doc_api.end_xp = resolve_end_xp()
+
+    -- 末章补上右端边界（原本 pos1 通常为空），build_epub_from_document 据此切出末章正文。
+    if doc_api.end_xp and #doc_api.toc > 0 then
+        local last = doc_api.toc[#doc_api.toc]
+        if not last.pos1 or last.pos1 == "" then last.pos1 = doc_api.end_xp end
+    end
+
+    -- 渲染 HTML 提取：仅 CreDocument 提供；用 pcall 包裹避免个别版本签名差异导致崩溃
+    if type(doc.getHTMLFromXPointers) == "function" then
+        doc_api.get_html = function(pos0, pos1)
+            if not pos0 or pos0 == "" then return nil end
+            local xp1 = pos1
+            if (not xp1 or xp1 == "") and doc_api.end_xp then xp1 = doc_api.end_xp end
+            if xp1 and xp1 ~= "" and xp1 ~= pos0 then
+                local okh, h = pcall(doc.getHTMLFromXPointers, doc, pos0, xp1, 0, false)
+                return okh and h or nil
+            end
+            -- 拿不到右端边界：退回单节点 HTML（旧行为），至少不抛错；
+            -- 上层「空书体检」会拦住由此产生的空壳 EPUB。
+            if type(doc.getHTMLFromXPointer) == "function" then
+                local okh, h = pcall(doc.getHTMLFromXPointer, doc, pos0, 0, false)
+                return okh and h or nil
+            end
+            return nil
+        end
+    end
+
+    -- 翻页回退（无 TOC 时按页聚合）
+    if type(doc.getPageXPointer) == "function" then
+        doc_api.get_page_xp = function(p)
+            local okp, xp = pcall(doc.getPageXPointer, doc, p)
+            return okp and xp or nil
+        end
+    end
+
+    return doc_api
+end
+
+-- 通用文档转换入口
+function TXT2EPUB:_convert_document(doc, file)
+    local doc_api = self:_build_doc_api(doc)
+    local base = (doc_api.title and doc_api.title ~= "") and doc_api.title
+        or (file and util.basename(file):gsub("%.[^.]+$", "")) or "未命名"
+    -- 清洗书名中的非法文件名字符（KOReader 书名可能含 / \ : 等）
+    base = (base:gsub('[\\/:*?"<>|]', "_")):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local lfs = require("libs/libkoreader-lfs")
+    local out_dir = (file and util.dirname(file)) or (lfs.currentdir() or "/")
+    local out_path = util.joinPath(out_dir, base .. ".epub")
+
+    self:_set_log(file or out_path)
+    self:_maintain_log(file or out_path)
+    self:_log("== 开始通用文档转换（KOReader 已打开文档），源：" .. tostring(file) .. "  书名：" .. tostring(base))
+
+    if file_exists(out_path) then
+        UIManager:show(ConfirmBox:new{
+            text = _("输出文件已存在，是否覆盖？\n") .. out_path,
+            ok_text = _("覆盖"),
+            cancel_text = _("取消"),
+            ok_callback = function() self:_run_document(doc_api, out_path, base) end,
+        })
         return
     end
-    local ext = self:file_ext()
-    if ext == ".docx" then
-        -- Word 文档：直接走 docx 转换流程（标题层级取自 Word 样式，无需章节标题预检）
-    elseif ext == ".txt" then
-        -- 文本文档：走既有 TXT 流程
-    elseif ext == ".doc" then
-        UIManager:show(InfoMessage:new{ text = _("暂不支持旧版 .doc 格式。\n请在 Word / WPS 中“另存为” .docx 后重试。") })
+    self:_run_document(doc_api, out_path, base)
+end
+
+function TXT2EPUB:_run_document(doc_api, out_path, base)
+    self:_open_progress(nil, "build")
+    self:_async_run(
+        function()
+            self._in_async = true
+            local r = self:_do_convert_document(doc_api, out_path, base)
+            self._in_async = false
+            return r
+        end,
+        function(err)
+            self._in_async = false
+            self:_close_progress()
+            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+        end,
+        function(res)
+            self:_close_progress()
+            res = res or {}
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("✓ 转换完成：共 %d 章\n已保存：\n%s"), res.count or 0, out_path),
+                timeout = 5,
+            })
+        end
+    )
+end
+
+function TXT2EPUB:_do_convert_document(doc_api, out_path, base)
+    local opts = {
+        indent = self:get_indent(),
+        style = self:get_style(),
+        book_title = base,
+        uid = "urn:uuid:" .. Converter.gen_uid(),
+        modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    }
+    self:_log("开始由已打开文档生成 EPUB：" .. out_path)
+    local build_ok, count, stats
+    local status, perr = pcall(function()
+        build_ok, count, stats = Converter.build_epub_from_document(doc_api, out_path, opts, {
+            on_yield = function()
+                if self._in_async then coroutine.yield() end
+            end,
+            on_progress = function(i)
+                self._progress_i = i
+                self._progress_total = nil
+                if i % 25 == 0 then
+                    self:_log(string.format("写入进度：%d 章", i))
+                end
+            end,
+        })
+    end)
+    if not status then
+        error("生成 EPUB 失败：" .. tostring(perr))
+    end
+    if not build_ok then
+        error("生成 EPUB 失败")
+    end
+
+    -- 空结果体检：若提取到的正文可见字符极少（CreDocument 对 Word/DOC 常见），
+    -- 说明 KOReader 的 DOM 没能给出可用正文。删除半成品，明确告知用户，
+    -- 绝不再交出一本"只剩标题"的空壳 EPUB。
+    stats = stats or {}
+    local visible = stats.visible_chars or 0
+    local toc_n = stats.toc_entries or 0
+    self:_log(string.format("DOM 提取体检：可见正文 %d 字符，TOC 条目 %d，章节 %d",
+        visible, toc_n, count or 0))
+    if Converter.is_empty_document_result(stats) then
+        pcall(os.remove, out_path)
+        error(_("无法从阅读器提取该文档正文。\n\nKOReader 对此格式的解析结果不含可用正文/目录。\n建议：在 Word / WPS 中「另存为 .docx」后重新转换（.docx 由插件直接解析，结果最完整）。"))
+    end
+    self:_set_progress(count, nil)
+    self:_log("EPUB 生成成功（通用文档），共 " .. count .. " 章：" .. out_path)
+    return { count = count }
+end
+
+function TXT2EPUB:convert(file)
+    -- 2.0.0 统一入口：用户只需「打开文档 → 点开始转换」，无需区分 doc / docx、
+    -- 也无需另存为。插件内部按"能否可靠自解析"自动选路（对用户透明）：
+    --   .txt   -> 插件自解析：标题正则 / 空格缩进（中文网文最佳）
+    --   .docx  -> 插件自解析：直接读 OOXML，Word 标题样式 -> 多级目录 + 完整正文
+    --            ★ 不走 KOReader DOM：真机验证 CreDocument 对 Word 文档 getToc()
+    --              只有 1 条、getHTMLFromXPointer 只返回单节点，会产出空书。
+    --   .doc / .rtf / .fb2 / .epub / .html 等
+    --          -> 通用 DOM 流程兜底（KOReader 能打开但插件无专用解析器），
+    --             带空结果体检，提取不到正文时明确提示而非交出空壳 EPUB。
+    local doc = self.ui and self.ui.document or nil
+    file = file or self:_current_file()
+    local ext = file and self:file_ext(file) or nil
+
+    if not doc and not file then
+        -- 没有任何已打开文档：打开文件选择器（主要针对 .txt）
+        self:pick_and_convert()
         return
-    else
-        UIManager:show(InfoMessage:new{ text = _("请先打开 TXT 或 Word(.docx) 文档") })
+    end
+    if ext ~= ".txt" and ext ~= ".docx" then
+        -- 插件无专用解析器的格式：交给通用 DOM 流程（或提示在 KOReader 中打开）
+        if doc then
+            self:_convert_document(doc, file)
+        else
+            UIManager:show(InfoMessage:new{
+                text = _("请在 KOReader 中打开该文档后再转换。\n本插件可直接转换已打开的 .doc / .docx / .rtf / .fb2 / .epub / .html 等文档。"),
+            })
+        end
         return
     end
 
+    -- .txt / .docx：走插件自解析（读磁盘源文件，可靠、与 KOReader 版本无关）
     self:_set_log(file)
     self:_maintain_log(file)
-    self:_log("== 开始转换流程，源文件：" .. tostring(file) .. "  类型：" .. tostring(ext))
+    self:_log("== 开始转换流程（自解析），源文件：" .. tostring(file) .. "  类型：" .. tostring(ext))
 
     self:_safe(function()
         local name = util.basename(file)

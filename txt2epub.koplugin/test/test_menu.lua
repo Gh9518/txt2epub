@@ -176,8 +176,12 @@ check("txt2epub 带 sorting_hint = \"tools\"",
 check("txt2epub 有 7 个子菜单项",
     menu_items.txt2epub and #menu_items.txt2epub.sub_item_table == 7,
     menu_items.txt2epub and ("实际=" .. #menu_items.txt2epub.sub_item_table) or "nil")
-check("开始转换项带 enabled_func",
-    menu_items.txt2epub and type(menu_items.txt2epub.sub_item_table[1].enabled_func) == "function")
+check("开始转换项不再用 enabled_func 静默置灰",
+    menu_items.txt2epub
+    and type(menu_items.txt2epub.sub_item_table[1].enabled_func) ~= "function",
+    "旧实现用 enabled_func 把非 .txt/.docx 文档的按钮置灰且无提示，导致点不了")
+check("开始转换项始终可点（有 callback）",
+    menu_items.txt2epub and type(menu_items.txt2epub.sub_item_table[1].callback) == "function")
 
 -- (3) 用真实 MenuSorter 跑合并排序，必须不抛错
 local ok, res = pcall(function()

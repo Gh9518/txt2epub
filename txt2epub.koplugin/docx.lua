@@ -3,16 +3,21 @@
 --
 -- 设计要点：
 --   * .docx 本质是一个 ZIP（OOXML）包；本模块用纯 Lua 解析 ZIP 容器（EOCD + 中央目录 + 本地头），
---     条目数据若是 deflate 压缩（method 8）则调用 KOReader 自带的 ffi/zlib 解压，Stored（method 0）直接用。
+--     条目数据若 deflate 压缩（method 8）则用同目录 inflate.lua 做 raw DEFLATE 解压，
+--     Stored（method 0）直接取用。
+--   * 注意：ZIP 条目是「裸 deflate 流」(raw, RFC1951)，不带 zlib 头与 adler32 尾，
+--     因此不能用 KOReader 的 ffi/zlib.zlib_uncompress()（其内部是 zlib uncompress()，
+--     只认 zlib 格式，喂 raw deflate 会 assert(res==0) 失败）。inflate.lua 为纯 Lua 实现，
+--     零 C 库/ffi 依赖，跨 Lua 5.1/5.3/LuaJIT 与所有设备一致，且内存有界。
 --   * 解析 word/document.xml：逐段（<w:p>）提取文本，并通过 <w:pStyle w:val> / <w:outlineLvl w:val>
 --     判定该段是否为“标题”及其层级（Heading1 -> 1，Heading2 -> 2 …），从而天然支持多级目录。
---   * 不依赖任何第三方 Lua/C 库：ZIP 解析是纯算术，解压复用设备上已有的 zlib。
+--   * 完全不依赖任何第三方 Lua/C 库：ZIP 解析与 DEFLATE 解压都是纯 Lua 算术。
 --
 -- 对外 API：
 --   DocxReader.read(path)        -> { title=书名, paragraphs = { {kind="heading", level=N, text=T} | {kind="body", text=T} } } 或 (nil, err)
 --   DocxReader.parse_document_xml(xml) -> paragraphs（纯函数，便于单元测试，不触碰 ZIP）
 -- 测试钩子：
---   DocxReader._entry_reader = function(name) -> 解压后的条目内容（字符串）  -- 注入用于绕过真实 ZIP 读取（如沙箱无 zlib 时）
+--   DocxReader._entry_reader = function(name) -> 解压后的条目内容（字符串）  -- 注入用于绕过真实 ZIP 读取
 
 local DocxReader = {}
 
@@ -31,7 +36,41 @@ end
 
 ------------------------------------------------------------------------
 -- XML 实体解码（OOXML 文本可能含 &amp; &lt; &gt; &quot; &apos; 及 &#NNN; / &#xHH;）
+--
+-- 重要：不要用 utf8.char()。KOReader 真机运行在 LuaJIT（Lua 5.1 兼容）上，
+-- 并没有 Lua 5.3 才引入的全局 `utf8` 库；一旦文档含数字字符实体
+-- （如 Word/WPS/在线转换工具常输出的 &#20013; / &#x4E2D;），
+-- 调用 utf8.char 会直接抛 "attempt to index global 'utf8' (a nil value)"
+-- 导致整次转换失败。而 utf8.char 对超范围/代理区码点在 Lua 5.3 上同样会抛
+-- "bad argument #1 to 'char' (value out of range)"。
+-- 因此这里用纯 Lua 算术实现码点 -> UTF-8，并对非法码点安全降级为 U+FFFD。
 ------------------------------------------------------------------------
+local REPLACEMENT_CHAR = "\239\191\189"  -- U+FFFD
+
+local function codepoint_to_utf8(u)
+    if type(u) ~= "number" or u ~= u or u < 0 or u > 0x10FFFF
+        or (u >= 0xD800 and u <= 0xDFFF) then
+        return REPLACEMENT_CHAR
+    end
+    if u < 0x80 then
+        return string.char(u)
+    elseif u < 0x800 then
+        return string.char(0xC0 + math.floor(u / 64), 0x80 + (u % 64))
+    elseif u < 0x10000 then
+        return string.char(
+            0xE0 + math.floor(u / 4096),
+            0x80 + (math.floor(u / 64) % 64),
+            0x80 + (u % 64)
+        )
+    end
+    return string.char(
+        0xF0 + math.floor(u / 262144),
+        0x80 + (math.floor(u / 4096) % 64),
+        0x80 + (math.floor(u / 64) % 64),
+        0x80 + (u % 64)
+    )
+end
+
 local function decode_entities(s)
     if not s or s == "" then return s end
     s = s:gsub("&lt;", "<")
@@ -39,8 +78,8 @@ local function decode_entities(s)
     s = s:gsub("&quot;", '"')
     s = s:gsub("&apos;", "'")
     s = s:gsub("&amp;", "&")  -- 必须最后替换，避免污染上面已经展开的实体
-    s = s:gsub("&#x([%x]+);", function(h) return utf8.char(tonumber(h, 16)) end)
-    s = s:gsub("&#(%d+);", function(d) return utf8.char(tonumber(d, 10)) end)
+    s = s:gsub("&#x([%x]+);", function(h) return codepoint_to_utf8(tonumber(h, 16)) end)
+    s = s:gsub("&#(%d+);", function(d) return codepoint_to_utf8(tonumber(d, 10)) end)
     return s
 end
 
@@ -292,22 +331,23 @@ local function read_entry(self, name)
     if e.method == 0 then
         return comp
     elseif e.method == 8 then
-        -- deflate：复用 KOReader 自带的 zlib
-        if not DocxReader._inflate then
-            local ok, zlib = pcall(require, "ffi/zlib")
-            if ok and zlib and zlib.zlib_uncompress then
-                DocxReader._inflate = function(cdata, usize)
-                    return zlib.zlib_uncompress(cdata, usize)
-                end
+        -- deflate：ZIP 条目是 raw DEFLATE，用纯 Lua 的 inflate.lua 解压。
+        -- 不能用 ffi/zlib.zlib_uncompress（只认 zlib 格式），否则真机必报
+        -- "ffi/zlib.lua:29: assertion failed!"。
+        if DocxReader._inflate == nil then
+            local ok, mod = pcall(require, "inflate")
+            if ok and type(mod) == "table" and type(mod.raw) == "function" then
+                DocxReader._inflate = mod
             else
                 DocxReader._inflate = false
             end
         end
         if DocxReader._inflate == false then
-            return nil, "当前环境缺少 zlib 解压支持（无法读取 .docx 压缩条目）"
+            return nil, "缺少 inflate 解压模块（inflate.lua 未随插件一起安装）"
         end
-        local ok, res = pcall(DocxReader._inflate, comp, e.uncomp_size)
+        local ok, res, ierr = pcall(DocxReader._inflate.raw, comp, e.uncomp_size)
         if not ok then return nil, "解压失败：" .. tostring(res) end
+        if not res then return nil, "解压失败：" .. tostring(ierr) end
         return res
     else
         return nil, "不支持的压缩方式：" .. tostring(e.method)

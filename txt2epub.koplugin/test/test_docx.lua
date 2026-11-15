@@ -6,7 +6,9 @@
 --   1) 纯 XML 解析：parse_document_xml 正确识别 Title/Heading1/Heading2 层级与正文、解码实体
 --   2) ZIP 读取（STORED 样本）：DocxReader.read 全流程，书名/段落正确
 --   3) 端到端：build_epub_from_docx 生成合法 EPUB，含多级嵌套目录（Stored 样本，无需 zlib）
---   4) （仅设备上）DEFALTE 样本：若 ffi/zlib 可用则用真实解压；沙箱无 zlib 时跳过
+--   4) DEFLATE 样本（真实 Word 压缩 docx）：由 inflate.lua 纯 Lua 解压，
+--      沙箱即可完整端到端验证，与 STORED 样本逐段比对，确保真机不再报
+--      "ffi/zlib.lua:29: assertion failed!"
 
 local plugin_dir = arg and arg[0] and arg[0]:match("(.*/)") or "./"
 if plugin_dir == "" then plugin_dir = "./" end
@@ -105,23 +107,55 @@ if ok then
 end
 
 ------------------------------------------------------------------------
--- 用例 4：DEFALTE 样本（需 ffi/zlib；沙箱无 zlib 时跳过）
+-- 用例 4：DEFLATE 样本（真实 Word 压缩 docx，全部条目 method=8）
+--   这是真机报错 "ffi/zlib.lua:29: assertion failed!" 的复现场景：
+--   之前沙箱因无 ffi/zlib 直接 SKIP，导致 raw-deflate 解压从未被验证过。
+--   现在 inflate.lua 为纯 Lua 实现，沙箱即可完整验证真机路径。
 ------------------------------------------------------------------------
-local has_zlib = false
-local okz, zlib = pcall(require, "ffi/zlib")
-if okz and zlib and zlib.zlib_uncompress then has_zlib = true end
-if has_zlib then
-    local d2, e2 = DocxReader.read(fixture("sample.docx"))
-    check("读取 DEFLATE docx 成功（真机 zlib）", d2 ~= nil, tostring(e2))
-    if d2 then
-        os.remove(out)
-        local ok2, _, cnt2 = pcall(Converter.build_epub_from_docx, fixture("sample.docx"), out, {
-            indent = "2em", style = "standard", book_title = "测试小说书名",
-        })
-        check("DEFLATE 端到端生成 EPUB", ok2, tostring(cnt2))
+local inf_ok, inflate_mod = pcall(require, "inflate")
+check("inflate.lua 可加载且提供 raw()", inf_ok and type(inflate_mod) == "table"
+    and type(inflate_mod.raw) == "function")
+
+local d2, e2 = DocxReader.read(fixture("sample.docx"))
+check("读取 DEFLATE docx 成功（纯 Lua 解压）", d2 ~= nil, tostring(e2))
+if d2 then
+    check("DEFLATE 书名与 STORED 一致", d2.title == doc.title,
+        tostring(d2.title) .. " vs " .. tostring(doc.title))
+    check("DEFLATE 段落数与 STORED 一致 = 12", #d2.paragraphs == #doc.paragraphs,
+        tostring(#d2.paragraphs) .. " vs " .. tostring(#doc.paragraphs))
+    -- 逐段比对文本与层级，确保解压结果与未压缩样本完全等价
+    local same = true
+    for i = 1, #doc.paragraphs do
+        local a, b = doc.paragraphs[i], d2.paragraphs[i]
+        if not b or a.kind ~= b.kind or a.level ~= b.level or a.text ~= b.text then
+            same = false
+            break
+        end
     end
-else
-    print("[SKIP] DEFLATE 样本：当前环境无 ffi/zlib（真机 KOReader 自带，发布后自动生效）")
+    check("DEFLATE 与 STORED 逐段完全一致", same)
+    check("确认走的是 inflate 而非 ffi/zlib", DocxReader._inflate == inflate_mod)
+
+    -- 端到端：压缩 docx 生成的 EPUB 必须有完整正文（不是空书）
+    local out2 = "/tmp/test_docx_deflate_out.epub"
+    os.remove(out2)
+    local ok2, _, cnt2 = pcall(Converter.build_epub_from_docx, fixture("sample.docx"), out2, {
+        indent = "2em", style = "standard", book_title = "测试小说书名",
+    })
+    check("DEFLATE 端到端生成 EPUB", ok2, tostring(cnt2))
+    if ok2 then
+        check("DEFLATE EPUB 章节数 = 5", cnt2 == 5, tostring(cnt2))
+        local tmp2 = "/tmp/test_docx_deflate_unzip"
+        os.execute("rm -rf " .. tmp2 .. " && mkdir -p " .. tmp2)
+        os.execute("cd " .. tmp2 .. " && unzip -o -q " .. out2 .. " >/dev/null 2>&1")
+        -- 第 1 章正文应含首章两段文字
+        local ch = io.open(tmp2 .. "/OEBPS/chapter_0001.xhtml", "r")
+        local body_ok = false
+        if ch then
+            local s = ch:read("*a"); ch:close()
+            body_ok = s:find("第一段正文") ~= nil and s:find("第二段正文") ~= nil
+        end
+        check("DEFLATE EPUB 首章正文完整（非空书）", body_ok)
+    end
 end
 
 ------------------------------------------------------------------------

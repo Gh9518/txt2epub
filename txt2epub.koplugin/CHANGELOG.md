@@ -2,12 +2,42 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.0.0（2026-11-14）
+### 重大变更：统一入口，无需区分格式 / 无需另存为
+用户侧只需「打开文档 → 点开始转换」。插件内部按**能否可靠自解析**自动选路，对格式无感：
+
+- **`.txt`**：插件自解析，标题正则 / 空格缩进识别（中文网文最佳）。
+- **`.docx`**：插件**直接解析 OOXML**（`build_epub_from_docx`）——Word 标题样式 → 多级目录 + 完整正文，纯 Lua 读 ZIP、不依赖 KOReader，结果最完整、最稳定。
+- **`.doc` / `.rtf` / `.fb2` / `.epub` / `.html`**：插件无专用解析器，改由 **KOReader 已打开文档的 DOM 兜底**（`build_epub_from_document`），旧版 `.doc` 等无需再另存为 `.docx`。所有 KOReader 专属调用（getProps / getToc / getHTMLFromXPointer(s) / getPageXPointer）均用 `pcall` 守护并抽象为 `doc_api` 接口，任一缺失都不会 panic。
+- **空结果体检**（`is_empty_document_result`）：DOM 提取到的正文可见字符过少时，删除半成品并明确提示"请另存为 .docx"，绝不静默交出空壳 EPUB。
+
+### 真机验证与修正（相对初始实现）
+- 曾尝试让 **Word(.docx) 也走通用 DOM 流程**：在 Kindle 上转换 `sample_stored.docx`，结果 EPUB 仅有标题 + 「测试小说书名」一行，无目录、无正文（crash.log 显示转换"成功"、无报错）。
+- **根因 1**：CreDocument 打开 Word 文档时 `getToc()` 只有 1 条（文档标题；Word 的「标题样式」≠ 文档目录），且末章 `getHTMLFromXPointer(pos0)` 只返回**单个节点**的 HTML（恰好是 Title 段），正文全部丢失。
+- **修正 1**：`.docx` 回到自解析（本地端到端验证 5 章 + 嵌套目录 + 完整正文）；DOM 流程仅保留给插件无法自解析的格式，并加空书体检。
+- **真机报错 2**：转换压缩版 `.docx`（真实 Word 保存的 DEFLATE 文件）弹出 `converter.lua: 读取 Word 文档失败：解压失败：./ffi/zlib.lua:29: assertion failed!`。此前只有不压缩的 STORED 样本能过（沙箱测试曾因无 `ffi/zlib` 直接跳过，从未验证压缩路径）。
+- **根因 2**：.docx 是 ZIP，条目存的是 **raw DEFLATE**（RFC1951，无 zlib 头、无 adler32 尾）；而 KOReader `ffi/zlib.zlib_uncompress()` 内部是 zlib `uncompress()`，**只认 zlib 格式**，喂 raw 流会返回 `Z_DATA_ERROR` 并触发 `assert(res == 0)` 失败。其 `zlib_h` 也未声明 `inflateInit2_`/`inflate` 等 raw-inflate 接口，无从借用。
+- **修正 2**：新增 **`inflate.lua`** —— 纯 Lua 实现的 raw DEFLATE 解压器（canonical Huffman + LZ77，算术代替位运算，兼容 Lua 5.1/5.3/LuaJIT；32 KB 回溯窗口 + 分块冻结，内存有界不 OOM），彻底不依赖设备 zlib / ffi / 外部进程。`docx.lua` 的 deflate 条目改由它解压，STORED 与 DEFLATE 统一走同一条 EPUB 打包链路。
+- 测试：`test_routing.lua`（25 项）锁定「.docx 走自解析、不走 DOM」与空书体检；`test_picker.lua`（20 项）匹配选择器扩列；新增 **`test_inflate.lua`（30 项）** 用真实 docx 压缩条目 + STORED/fixed/dynamic/多压缩级别/1.84 MB 大文件逐字节比对；`test_docx.lua`（29 项）取消 DEFLATE 跳过、改为沙箱内完整端到端验证。
+
+### 大文件压测后的代码审查修正（发布前）
+大文件测试全绿后，进一步对照 KOReader 真机源码审查，修掉 3 个「测试全绿、真机/大文件却会翻车」的隐患：
+- **数字字符实体崩溃**：`docx.lua` 用 Lua 5.3 才有的 `utf8.char` 解 `&#20013;` / `&#x4E2D;`，而 KOReader 真机是 **LuaJIT（无全局 utf8 库）** → 含此类实体的 Word 文档转换直接抛错；超范围码点在 Lua 5.3 上也会抛 `value out of range`。改为纯 Lua 码点→UTF-8，并对非法/超范围码点安全降级为 U+FFFD。
+- **DOM 兜底格式真机全废**：`_build_doc_api` 误按 `text/pos0/pos1` 读 KOReader 的 TOC，而真实字段是 **`title/page/depth/xpointer`**（见 `readertoc.lua`）→ `pos0` 恒为 nil、所有条目被跳过 → `.doc`/RTF/FB2/EPUB/HTML 全部落进空书提示，一个都转不出来。此前测试全用模拟 `doc_api` 手工灌 `pos0`，**从未覆盖真机适配层**。修正字段映射 + 无 xpointer 时用页码经 `getPageXPointer` 换算 + 补齐文档末尾 xpointer（末章不再退化为「单节点 HTML」）；`build_epub_from_document` 右端边界改为「下一个有 pos0 的条目」，避免中间无效条目导致整章延伸到文档末尾。
+- **单段超长绕过 256 KB 切分**：Word「一整章不分段」时 `emit` 要求 `#paras > 1` 才切分，会产出 576 KB 单章 XHTML（Kindle indexer 卡顿/重启诱因）；DOM 路径无 `</p>` 边界时 `split_html_at_p` 同样失效。新增 UTF-8 安全的超长文本拆分 + DOM 二次硬切，单章 XHTML 稳定 < 300 KB，正文完整保留。
+- 新增 **`test_docapi.lua`（34 项）** 用贴近真机的 mock 文档对象验证「适配层 → converter → EPUB」全链路；**`test_regress.lua`（19 项）** 自包含生成样本，双解释器锁定实体解码 / 单段超长 / 无边界切分；收紧 `test_big_files.lua` 的 `pcall` 断言（同时校验 build 的 `ok` 返回值，消除假通过）。**全套 304 项 × Lua 5.3 / LuaJIT 双解释器通过**。
+
+## v1.0.1（2026-11-14）
+### 修复
+- **「开始转换」按钮变灰、点不了（尤其 DOCX）**：旧实现用 `enabled_func` 把「当前文档不是 .txt/.docx」的菜单项静默置灰且无提示；而 KOReader 打开 DOCX 后 `document.file` 在某些版本下并非原始 `.docx` 路径（内部转换），导致判断失效、按钮置灰。
+  改为：**按钮始终可点**；真正的源判定移到 `convert()` 内；当打开的并非可用源文件（epub/pdf，或 DOCX 路径被改写）时，**弹出文件选择器让用户直接点选磁盘上的 `.txt`/`.docx`**，彻底绕开对 `document.file` 扩展名的不可靠依赖。新增 `test_picker.lua`（19 项）覆盖该逻辑。
+
 ## v1.0.0（2026-11-05）
 首个公开发布版本。
 
 ### 功能
 - TXT → EPUB 一键转换（菜单「工具 › TXT2EPUB」），输出同名 `.epub` 至原目录。
-- **Word(.docx) → EPUB 转换**：章节层级取自 Word 标题样式（Title / Heading1–9、含中/日/法/德文样式名与 outlineLvl），自动生成多级目录；纯 Lua 解析 OOXML（ZIP 容器 + zlib 解压），不依赖第三方库。旧版 `.doc` 暂不支持。
+- **Word(.docx) → EPUB 转换**：章节层级取自 Word 标题样式（Title / Heading1–9、含中/日/法/德文样式名与 outlineLvl），自动生成多级目录；纯 Lua 解析 OOXML（ZIP 容器 + 纯 Lua raw DEFLATE 解压），不依赖第三方库。旧版 `.doc` 暂不支持。
 - 多级章节目录：卷/部/册/篇 → 章/回 → 节/集/幕，生成 EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`。
 - 排版预设：紧凑 / 标准 / 宽松大字 / 自定义，转换时烘焙进 `style.css`，无常驻钩子。
 - 本地字体选择：列出本机全部字体，菜单按界面语言显示中文名/英文名及样式（粗体·斜体）；存储值仍为系统可识别的英文族名。

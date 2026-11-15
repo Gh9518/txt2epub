@@ -475,6 +475,48 @@ local function escape_html(s)
 end
 
 ------------------------------------------------------------------------
+-- 4a-2. 超长文本拆分（防止「一整章不分段」产出单个数百 KB 的 XHTML）
+--   Word 里把一整章写进同一个 <w:p> 很常见；若不拆，build_epub_from_docx
+--   的按段切分（要求 #paras > 1）会失效，直接写出 500KB+ 的单章 XHTML，
+--   在 Kindle 这类低内存设备上容易触发 indexer 卡死 / 重启（历史故障诱因）。
+--   按 UTF-8 字符边界切，绝不把多字节汉字切成半个。
+------------------------------------------------------------------------
+local function split_utf8_text(s, max)
+    if #s <= max then return { s } end
+    local out = {}
+    local i, n = 1, #s
+    while i <= n do
+        local j = math.min(i + max - 1, n)
+        if j < n then
+            -- 下一段起点若在续字节(0x80..0xBF)上，说明 j 切在字符中间，回退
+            local b = s:byte(j + 1)
+            while j > i and b and b >= 0x80 and b < 0xC0 do
+                j = j - 1
+                b = s:byte(j + 1)
+            end
+        end
+        out[#out + 1] = s:sub(i, j)
+        i = j + 1
+    end
+    return out
+end
+
+-- 把超过 limit 的单个段落拆成 <= piece 字节的子段（其余段落原样保留）。
+-- 只有确实存在超长段落时才重建数组，正常情况下零开销。
+local function expand_long_paras(paras, limit, piece)
+    local out, changed = {}, false
+    for _, p in ipairs(paras) do
+        if #p > limit then
+            for _, seg in ipairs(split_utf8_text(p, piece)) do out[#out + 1] = seg end
+            changed = true
+        else
+            out[#out + 1] = p
+        end
+    end
+    return changed and out or paras
+end
+
+------------------------------------------------------------------------
 -- 4b. 排版优化（参考 moon.koplugin）：段落回流 + 硬行判定
 ------------------------------------------------------------------------
 -- 判断一行是否为“硬行”（列表项 / 对话句首），应独立成段
@@ -1374,6 +1416,10 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
     -- paras 为“每行一段纯文本”的字符串数组（已做段落回流合并）。
     local function emit(title, paras, level)
         level = level or 0
+        -- 单段超长保护：一整章写在同一段时，先把 >256KB 的段落按 UTF-8 边界
+        -- 拆成 64KB 子段，让下面的按段切分真正生效，避免产出单个 500KB+ 的
+        -- XHTML（Kindle indexer / 渲染卡顿、甚至重启的已知诱因）。
+        paras = expand_long_paras(paras, MAX_CHAPTER_BYTES, 64 * 1024)
         i = i + 1
         local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
         if #xhtml > MAX_CHAPTER_BYTES and #paras > 1 then
@@ -1581,6 +1627,10 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
 
     local function emit(title, paras, level)
         level = level or 0
+        -- 单段超长保护：一整章写在同一段时，先把 >256KB 的段落按 UTF-8 边界
+        -- 拆成 64KB 子段，让下面的按段切分真正生效，避免产出单个 500KB+ 的
+        -- XHTML（Kindle indexer / 渲染卡顿、甚至重启的已知诱因）。
+        paras = expand_long_paras(paras, MAX_CHAPTER_BYTES, 64 * 1024)
         i = i + 1
         local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
         if #xhtml > MAX_CHAPTER_BYTES and #paras > 1 then
@@ -1687,6 +1737,240 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
     zip:close()
     collectgarbage("collect")
     return true, #toc
+end
+
+------------------------------------------------------------------------
+-- 9e. 从“已打开文档”转换：直接利用 KOReader 解析后的 DOM
+--   不再区分 .doc / .docx / .rtf / .fb2 / .epub / .html —— 只要 KOReader
+--   能打开（经 CreDocument 渲染），我们就用其内存中的 TOC + 渲染 HTML
+--   直接生成 EPUB。这就是“直接转换 KOReader 已转换过的内容”，无需
+--   关心源文件到底是 doc 还是 docx（也顺带支持 epub / html / fb2 等）。
+-- doc_api : 抽象文档接口（由 main.lua 从真实 KOReader 文档对象适配而来）：
+--   { title = string|nil,
+--     author = string|nil,
+--     toc    = { {text=..., depth=..., pos0=..., pos1=...}, ... }（可空），
+--     get_html(pos0, pos1) -> string|nil,   -- 取 [pos0, pos1) 区间的渲染 HTML
+--     page_count = number,
+--     get_page_xp(p) -> string|nil }         -- 无 TOC 时的按页回退
+--   get_html 由 CreDocument:getHTMLFromXPointers / getHTMLFromXPointer 适配而来；
+--   非 CreDocument 格式（如 PDF/MuPDF）没有该方法，此时本函数会安全回退。
+-- out_path/opts/hooks 同 build_epub
+-- 返回：true, count（EPUB 章节文件数）
+------------------------------------------------------------------------
+
+-- 判定 DOM 提取结果是否为「疑似空书」：正文可见字符过少即认为没提取到正文。
+-- 抽成纯函数便于 main 与测试共用同一阈值（默认 20 个可见字符）。
+function Converter.is_empty_document_result(stats, threshold)
+    if type(stats) ~= "table" then return false end
+    local v = stats.visible_chars or 0
+    return v < (threshold or 20)
+end
+
+-- 去掉 cre 个别版本可能吐出的 <html>/<body> 包裹，只保留正文片段
+local function sanitize_document_html(html)
+    if not html or html == "" then return "" end
+    html = html:gsub("^%s*<%?xml.-%?>%s*", "")
+    html = html:gsub("^%s*<!DOCTYPE.-]>%s*", "")
+    html = html:gsub("^%s*<html.->", ""):gsub("</html>%s*$", "")
+    html = html:gsub("^%s*<body.->", ""):gsub("</body>%s*$", "")
+    return html
+end
+
+-- 章节 XHTML（原始 HTML 直出，不转义正文；标题仍做 XML 转义）
+function Converter.build_chapter_xhtml_raw(title, raw_html, level)
+    level = level or 0
+    local lv_class = level > 0 and (" lv-" .. level) or ""
+    local body = sanitize_document_html(raw_html or "")
+    local blocks = {}
+    blocks[#blocks + 1] = '<?xml version="1.0" encoding="UTF-8"?>'
+    blocks[#blocks + 1] = '<!DOCTYPE html>'
+    blocks[#blocks + 1] = '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="zh" xml:lang="zh">'
+    blocks[#blocks + 1] = '<head>'
+    blocks[#blocks + 1] = '<meta charset="UTF-8"/>'
+    blocks[#blocks + 1] = '<title>' .. escape_xml(title) .. '</title>'
+    blocks[#blocks + 1] = '<link rel="stylesheet" type="text/css" href="style.css"/>'
+    blocks[#blocks + 1] = '</head>'
+    blocks[#blocks + 1] = '<body>'
+    blocks[#blocks + 1] = '<h1 class="chapter-title' .. lv_class .. '">' .. escape_xml(title) .. '</h1>'
+    blocks[#blocks + 1] = body
+    blocks[#blocks + 1] = '</body>'
+    blocks[#blocks + 1] = '</html>'
+    return table.concat(blocks, "\n")
+end
+
+-- 把过长的 raw_html 在 </p> 边界处切分为若干 <= max 字节的片段
+local function split_html_at_p(html, max)
+    local frags = {}
+    local buf = {}
+    local len = 0
+    local pos = 1
+    local n = #html
+    while pos <= n do
+        local p = string.find(html, "</p>", pos)
+        local seg
+        if p then
+            seg = string.sub(html, pos, p + 3)  -- 含 </p>
+            pos = p + 4
+        else
+            seg = string.sub(html, pos)
+            pos = n + 1
+        end
+        if len + #seg > max and #buf > 0 then
+            frags[#frags + 1] = table.concat(buf)
+            buf = {}
+            len = 0
+        end
+        buf[#buf + 1] = seg
+        len = len + #seg
+    end
+    if #buf > 0 then frags[#frags + 1] = table.concat(buf) end
+    if #frags == 0 then frags[1] = html end
+    -- 二次保险：整章若没有任何 </p> 边界（如只有一个超长 <p>，或 cre 用
+    -- <div> 分段），frags 仍是单个超大片段，切分等于没生效。再按 max 硬切
+    -- 一次（UTF-8 边界），保证写出的 XHTML 不会是数百 KB 的单文件。
+    -- DOM 兜底路径本就是「尽力而为」，宁可片段边界落在标签中间，也不能 OOM。
+    local final = {}
+    for _, frag in ipairs(frags) do
+        if #frag > max then
+            for _, sub in ipairs(split_utf8_text(frag, max)) do final[#final + 1] = sub end
+        else
+            final[#final + 1] = frag
+        end
+    end
+    if #final == 0 then final[1] = html end
+    return final
+end
+
+function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
+    opts = opts or {}
+    local indent = opts.indent or "2em"
+    local book_title = opts.book_title or doc_api.title or "未命名"
+    local uid = opts.uid or ("urn:uuid:" .. Converter.gen_uid())
+    local modified = opts.modified or os.date("!%Y-%m-%dT%H:%M:%SZ")
+
+    local get_html = (type(doc_api.get_html) == "function") and doc_api.get_html or nil
+
+    --------------------------------------------------------------------
+    -- 1) 由 TOC / 渲染 HTML 构造章节（title / level / raw_html）
+    --------------------------------------------------------------------
+    local chapters = {}
+    local toc = doc_api.toc or {}
+    if #toc > 0 and get_html then
+        for i, entry in ipairs(toc) do
+            if entry.pos0 then
+                -- 本段 HTML = [本条目 pos0, 下一个「有 pos0」的条目) ；
+                -- 末条目用其 pos1，再不行用 doc_api.end_xp（文档末尾 xpointer）。
+                -- 不能简单取 toc[i+1].pos0：中间若有无效条目，会让本章错误地
+                -- 一路延伸到文档末尾、与后续章节重复。
+                local next_pos = nil
+                for j = i + 1, #toc do
+                    if toc[j].pos0 and toc[j].pos0 ~= "" then next_pos = toc[j].pos0; break end
+                end
+                if not next_pos or next_pos == "" then next_pos = entry.pos1 end
+                if not next_pos or next_pos == "" then next_pos = doc_api.end_xp end
+                local html = ""
+                local ok, h = pcall(get_html, entry.pos0, next_pos)
+                if ok and type(h) == "string" then html = h end
+                chapters[#chapters + 1] = {
+                    title = (entry.text and entry.text ~= "") and entry.text or (book_title .. " " .. i),
+                    level = entry.depth or 1,
+                    raw_html = html,
+                }
+            end
+        end
+    end
+    -- 无 TOC：按页聚合为单章（PDF 等非 CreDocument 即便有页也无法取 HTML，此处仅作回退）
+    if #chapters == 0 and get_html and doc_api.page_count and doc_api.page_count > 0
+        and type(doc_api.get_page_xp) == "function" then
+        local parts = {}
+        for p = 1, doc_api.page_count do
+            local ok, h = pcall(get_html, doc_api.get_page_xp(p), doc_api.get_page_xp(p + 1))
+            if ok and type(h) == "string" and h ~= "" then parts[#parts + 1] = h end
+        end
+        chapters[#chapters + 1] = { title = book_title, level = 0, raw_html = table.concat(parts) }
+    end
+    if #chapters == 0 then
+        -- 兜底：什么都拿不到（如 PDF 等非 CreDocument 格式），至少生成一个空章节，保证 EPUB 合法
+        chapters[#chapters + 1] = { title = book_title, level = 0, raw_html = "" }
+    end
+
+    -- 空结果体检：统计所有章节「正文」去掉标签/实体后的可见字符数。
+    -- 真机上 CreDocument 对 Word 文档常返回「TOC 仅 1 条 + 单节点 HTML」，
+    -- 结果就是一本只剩标题的空书；这里把"疑似空书"量化，交给上层提示用户。
+    local visible_chars = 0
+    for _, ch in ipairs(chapters) do
+        local h = ch.raw_html
+        if h and h ~= "" then
+            local t = h:gsub("<[^>]*>", ""):gsub("&%w+;", ""):gsub("&#%d+;", ""):gsub("%s+", "")
+            visible_chars = visible_chars + #t
+        end
+    end
+    local stats = {
+        chapter_count = #chapters,
+        toc_entries = #toc,
+        visible_chars = visible_chars,
+    }
+    -- 让上层能在写盘前就能复用同一判定（也可用 opts.hooks 之外的独立函数）
+    stats.empty = Converter.is_empty_document_result(stats)
+
+    --------------------------------------------------------------------
+    -- 2) 逐章写出（复用同一套 EPUB 构件与轻量 toc 元数据）
+    --------------------------------------------------------------------
+    local zip = ZipWriter:new(out_path)
+    zip:add("mimetype", "application/epub+zip")
+
+    local toc_meta = {}
+    local i = 0
+    local MAX_CHAPTER_BYTES = 256 * 1024
+
+    local function emit(title, raw_html, level)
+        level = level or 0
+        i = i + 1
+        local xhtml = Converter.build_chapter_xhtml_raw(title, raw_html, level)
+        if #xhtml > MAX_CHAPTER_BYTES and #raw_html > 1 then
+            -- 超长章节：在 </p> 边界切分为多个文件（仅首个分片计入目录）
+            local parts = split_html_at_p(raw_html, MAX_CHAPTER_BYTES)
+            local part = 1
+            for _, seg in ipairs(parts) do
+                local t = (part == 1) and title or (title .. "（" .. part .. "）")
+                local px = Converter.build_chapter_xhtml_raw(t, seg, level)
+                local fname = string.format("OEBPS/chapter_%04d%s.xhtml", i, (part == 1) and "" or ("_" .. part))
+                zip:add(fname, px)
+                toc_meta[#toc_meta + 1] = { file = fname, title = t, level = level, toc = (part == 1) }
+                part = part + 1
+                if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
+                if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end
+            end
+            if i % 5 == 0 then collectgarbage("collect") end
+        else
+            local fname = string.format("OEBPS/chapter_%04d.xhtml", i)
+            zip:add(fname, xhtml)
+            toc_meta[#toc_meta + 1] = { file = fname, title = title, level = level, toc = true }
+            raw_html = nil            -- 已写入磁盘，释放正文
+            if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
+            if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end
+            if i % 5 == 0 then collectgarbage("collect") end
+        end
+    end
+
+    for _, ch in ipairs(chapters) do
+        emit(ch.title, ch.raw_html, ch.level)
+    end
+
+    local toc_for_nav = {}
+    for _, e in ipairs(toc_meta) do
+        if e.toc ~= false then toc_for_nav[#toc_for_nav + 1] = e end
+    end
+    local nested = Converter.nest_toc(toc_for_nav)
+    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
+    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
+    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
+    zip:add("OEBPS/content.opf", Converter.build_opf(toc_meta, book_title, uid, modified))
+    zip:add("META-INF/container.xml", Converter.build_container())
+    zip:close()
+    collectgarbage("collect")
+    -- 第三返回值 stats 供上层做"空结果体检"：visible_chars 过少说明 DOM 没提取到正文
+    return true, #toc_meta, stats
 end
 
 return Converter

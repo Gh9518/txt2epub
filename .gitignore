@@ -9,5 +9,8 @@ moon-main/
 txtstyle.lua
 重启根因分析.md
 
+# Local big-file test samples (delivered separately for on-device testing)
+测试文件/
+
 # Local environment
 .codebuddy/
