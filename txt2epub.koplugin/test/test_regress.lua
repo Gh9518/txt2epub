@@ -154,5 +154,37 @@ if dbok and dres ~= false then
 end
 os.remove(dout)
 
+----------------------------------------------------------------------
+-- 4) 畸形 / 截断 .docx：必须返回明确错误，不得抛 Lua 异常
+----------------------------------------------------------------------
+print("\n---- [4] 畸形 / 截断 docx 的健壮性 ----")
+local function write_raw(path, s) local f = io.open(path, "wb"); f:write(s); f:close() end
+local malformed = {
+    { name = "空文件", data = "" },
+    { name = "随机字节", data = "\1\2\3\4not a zip\5\6\7" },
+    { name = "只有 EOCD 签名", data = string.char(0x50, 0x4b, 0x05, 0x06) },
+    { name = "EOCD 后面字段全截断", data = string.char(0x50, 0x4b, 0x05, 0x06) .. string.rep("\0", 10) },
+    { name = "EOCD 声称大量条目", data = string.char(0x50, 0x4b, 0x05, 0x06)
+        .. string.rep("\0", 8) .. le16(500) .. le32(1000) .. le32(0) .. le32(0) .. le16(0) },
+}
+for _, m in ipairs(malformed) do
+    local p = "/tmp/test_regress_bad.docx"
+    write_raw(p, m.data)
+    local ok, res, err = pcall(DocxReader.read, p)
+    check("畸形文件不抛异常：" .. m.name, ok, tostring(res))
+    if ok then
+        check("畸形文件返回 (nil, 明确错误)：" .. m.name, res == nil and type(err) == "string",
+            "res=" .. tostring(res) .. " err=" .. tostring(err))
+    end
+end
+os.remove("/tmp/test_regress_bad.docx")
+-- 正常文件不受影响（回归）
+local normal = "/tmp/test_regress_normal.docx"
+make_stored_docx(normal, '<w:document xmlns:w="x"><w:body><w:p><w:r><w:t>正文</w:t></w:r></w:p></w:body></w:document>')
+local nres, nerr = DocxReader.read(normal)
+check("合法 docx 仍正常读取（健壮性改动无回归）", type(nres) == "table"
+    and nres.paragraphs[1].text == "正文", tostring(nerr))
+os.remove(normal)
+
 print(string.format("\n=== test_regress：%d 通过, %d 失败 ===", passes, fails))
 os.exit(fails == 0 and 0 or 1)

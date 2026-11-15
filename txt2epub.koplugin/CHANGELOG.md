@@ -25,7 +25,8 @@
 - **数字字符实体崩溃**：`docx.lua` 用 Lua 5.3 才有的 `utf8.char` 解 `&#20013;` / `&#x4E2D;`，而 KOReader 真机是 **LuaJIT（无全局 utf8 库）** → 含此类实体的 Word 文档转换直接抛错；超范围码点在 Lua 5.3 上也会抛 `value out of range`。改为纯 Lua 码点→UTF-8，并对非法/超范围码点安全降级为 U+FFFD。
 - **DOM 兜底格式真机全废**：`_build_doc_api` 误按 `text/pos0/pos1` 读 KOReader 的 TOC，而真实字段是 **`title/page/depth/xpointer`**（见 `readertoc.lua`）→ `pos0` 恒为 nil、所有条目被跳过 → `.doc`/RTF/FB2/EPUB/HTML 全部落进空书提示，一个都转不出来。此前测试全用模拟 `doc_api` 手工灌 `pos0`，**从未覆盖真机适配层**。修正字段映射 + 无 xpointer 时用页码经 `getPageXPointer` 换算 + 补齐文档末尾 xpointer（末章不再退化为「单节点 HTML」）；`build_epub_from_document` 右端边界改为「下一个有 pos0 的条目」，避免中间无效条目导致整章延伸到文档末尾。
 - **单段超长绕过 256 KB 切分**：Word「一整章不分段」时 `emit` 要求 `#paras > 1` 才切分，会产出 576 KB 单章 XHTML（Kindle indexer 卡顿/重启诱因）；DOM 路径无 `</p>` 边界时 `split_html_at_p` 同样失效。新增 UTF-8 安全的超长文本拆分 + DOM 二次硬切，单章 XHTML 稳定 < 300 KB，正文完整保留。
-- 新增 **`test_docapi.lua`（34 项）** 用贴近真机的 mock 文档对象验证「适配层 → converter → EPUB」全链路；**`test_regress.lua`（19 项）** 自包含生成样本，双解释器锁定实体解码 / 单段超长 / 无边界切分；收紧 `test_big_files.lua` 的 `pcall` 断言（同时校验 build 的 `ok` 返回值，消除假通过）。**全套 304 项 × Lua 5.3 / LuaJIT 双解释器通过**。
+- **畸形 / 截断 docx 健壮性**：`le16`/`le32` 越界返回 nil、ZIP 各字段做边界检查、`DocxReader.read` 加 `pcall` 兜底，损坏文件统一返回明确错误而非抛出 Lua 算术异常。
+- 新增 **`test_docapi.lua`（34 项）** 用贴近真机的 mock 文档对象验证「适配层 → converter → EPUB」全链路；**`test_regress.lua`（30 项）** 自包含生成样本，双解释器锁定实体解码 / 单段超长 / 无边界切分 / 畸形文件；收紧 `test_big_files.lua` 的 `pcall` 断言（同时校验 build 的 `ok` 返回值，消除假通过）。**全套 315 项 × Lua 5.3 / LuaJIT 双解释器通过**。
 
 ## v1.0.1（2026-11-14）
 ### 修复

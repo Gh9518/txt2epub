@@ -24,14 +24,17 @@ local DocxReader = {}
 ------------------------------------------------------------------------
 -- 小工具：小端整数读取（data 为完整文件字符串，off 为 1-based 字节下标）
 ------------------------------------------------------------------------
+-- 越界返回 nil（畸形/截断文件不能让 Lua 抛 "arithmetic on a nil value"，
+-- 由调用方转成明确的「文件损坏」提示）
 local function le16(s, off)
-    return s:byte(off) + s:byte(off + 1) * 256
+    local a, b = s:byte(off), s:byte(off + 1)
+    if not a or not b then return nil end
+    return a + b * 256
 end
 local function le32(s, off)
-    return s:byte(off)
-        + s:byte(off + 1) * 256
-        + s:byte(off + 2) * 65536
-        + s:byte(off + 3) * 16777216
+    local a, b, c, d = s:byte(off), s:byte(off + 1), s:byte(off + 2), s:byte(off + 3)
+    if not a or not b or not c or not d then return nil end
+    return a + b * 256 + c * 65536 + d * 16777216
 end
 
 ------------------------------------------------------------------------
@@ -286,12 +289,16 @@ local function parse_zip(data)
     if not eocd then return nil, "不是合法的 ZIP / .docx 文件（找不到 EOCD）" end
     local total = le16(data, eocd + 10)
     local cd_off = le32(data, eocd + 16)
+    -- 畸形/截断文件：字段缺失时返回明确错误，不做 nil 算术
+    if not total or not cd_off or cd_off + 46 > n then
+        return nil, "ZIP / .docx 结构损坏（EOCD / 中央目录越界）"
+    end
     local entries = {}
     -- 中央目录偏移为 0 基，Lua 字符串索引为 1 基，需 +1
     local off = cd_off + 1
     for _ = 1, total do
-        if le32(data, off) ~= 0x02014b50 then
-            return nil, "中央目录结构异常"
+        if off + 46 > n or le32(data, off) ~= 0x02014b50 then
+            return nil, "中央目录结构异常或数据截断"
         end
         local method = le16(data, off + 10)
         local comp_size = le32(data, off + 20)
@@ -300,6 +307,10 @@ local function parse_zip(data)
         local extralen = le16(data, off + 30)
         local commentlen = le16(data, off + 32)
         local local_off = le32(data, off + 42)
+        if not method or not comp_size or not uncomp_size or not fnlen
+            or not extralen or not commentlen or not local_off then
+            return nil, "中央目录条目字段截断"
+        end
         local name = data:sub(off + 46, off + 45 + fnlen)
         entries[name] = {
             method = method,
@@ -321,12 +332,18 @@ local function read_entry(self, name)
     if not e then return nil end
     -- 本地文件头偏移为 0 基，转为 1 基
     local lo = e.local_off + 1
-    if le32(self.data, lo) ~= 0x04034b50 then
-        return nil, "本地文件头签名错误：" .. name
+    if lo + 30 > #self.data or le32(self.data, lo) ~= 0x04034b50 then
+        return nil, "本地文件头签名错误或数据截断：" .. name
     end
     local fnlen = le16(self.data, lo + 26)
     local extralen = le16(self.data, lo + 28)
+    if not fnlen or not extralen then
+        return nil, "本地文件头字段截断：" .. name
+    end
     local data_start = lo + 30 + fnlen + extralen
+    if data_start + e.comp_size - 1 > #self.data then
+        return nil, "条目压缩数据截断：" .. name
+    end
     local comp = self.data:sub(data_start, data_start + e.comp_size - 1)
     if e.method == 0 then
         return comp
@@ -356,8 +373,10 @@ end
 
 ------------------------------------------------------------------------
 -- 对外：读取 .docx 文件
+--   用 pcall 兜底：畸形/截断/伪造的 ZIP 里任何未预料的算术或索引异常，
+--   一律转成「解析失败」的明确错误返回，绝不把 Lua 异常抛给上层 UI。
 ------------------------------------------------------------------------
-function DocxReader.read(path)
+local function read_impl(path)
     local f = io.open(path, "rb")
     if not f then return nil, "无法打开文件：" .. tostring(path) end
     local data = f:read("*a")
@@ -395,6 +414,14 @@ function DocxReader.read(path)
 
     local paragraphs = DocxReader.parse_document_xml(doc_xml)
     return { title = title, paragraphs = paragraphs }
+end
+
+function DocxReader.read(path)
+    local ok, res, err = pcall(read_impl, path)
+    if not ok then
+        return nil, "Word 文档解析失败（文件可能损坏）：" .. tostring(res)
+    end
+    return res, err
 end
 
 return DocxReader
