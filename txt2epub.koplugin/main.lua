@@ -1117,8 +1117,9 @@ function TXT2EPUB:_do_convert_document(doc_api, out_path, base)
     stats = stats or {}
     local visible = stats.visible_chars or 0
     local toc_n = stats.toc_entries or 0
-    self:_log(string.format("DOM 提取体检：可见正文 %d 字符，TOC 条目 %d，章节 %d",
-        visible, toc_n, count or 0))
+    self:_log(string.format("DOM 提取体检：可见正文 %d 字符，TOC 条目 %d，正文标题 %d，重切分 %s，章节 %d",
+        visible, toc_n, stats.detected_titles or 0,
+        stats.resplit and "是" or "否", count or 0))
     if Converter.is_empty_document_result(stats) then
         pcall(os.remove, out_path)
         error(_("无法从阅读器提取该文档正文。\n\nKOReader 对此格式的解析结果不含可用正文/目录。\n建议：在 Word / WPS 中「另存为 .docx」后重新转换（.docx 由插件直接解析，结果最完整）。"))

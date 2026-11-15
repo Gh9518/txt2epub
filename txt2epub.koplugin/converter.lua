@@ -1766,14 +1766,21 @@ function Converter.is_empty_document_result(stats, threshold)
     return v < (threshold or 20)
 end
 
--- 去掉 cre 个别版本可能吐出的 <html>/<body> 包裹，只保留正文片段
+-- 去掉 cre 个别版本可能吐出的文档级包裹与非正文内容，只保留正文片段。
+-- 按页聚合时「每一页」都可能自带一份完整包裹，若只去首尾，重切分后的章节里
+-- 会残留嵌套的 <body>/<head>，导致 EPUB 解析异常，故这里做全局剥离。
+-- <style>/<script> 文本必须一并删掉：否则它和「本页第一个标题」落在同一个
+-- 文本块里，标题判定会被 "p{color:#000} 第一卷 …" 这类前缀污染而漏识别。
 local function sanitize_document_html(html)
     if not html or html == "" then return "" end
-    html = html:gsub("^%s*<%?xml.-%?>%s*", "")
-    html = html:gsub("^%s*<!DOCTYPE.-]>%s*", "")
-    html = html:gsub("^%s*<html.->", ""):gsub("</html>%s*$", "")
-    html = html:gsub("^%s*<body.->", ""):gsub("</body>%s*$", "")
-    return html
+    html = html:gsub("<%?xml.-%?>", "")
+    html = html:gsub("<!DOCTYPE[^>]*>", "")
+    html = html:gsub("<head.->.-</head>", "")
+    html = html:gsub("<style.->.-</style>", "")
+    html = html:gsub("<script.->.-</script>", "")
+    html = html:gsub("</?html[^>]*>", "")
+    html = html:gsub("</?body[^>]*>", "")
+    return (html:gsub("^%s+", ""))
 end
 
 -- 章节 XHTML（原始 HTML 直出，不转义正文；标题仍做 XML 转义）
@@ -1841,6 +1848,154 @@ local function split_html_at_p(html, max)
     return final
 end
 
+------------------------------------------------------------------------
+-- 9d-2. DOM 兜底格式的「正文标题识别 + 重切分」
+--   背景（真机日志 2026-11-15 11:22:32，big_novel.doc）：
+--     「DOM 提取体检：可见正文 2204261 字符，TOC 条目 0，章节 15」
+--   .doc / .rtf / .fb2 经 KOReader CreDocument 渲染后，Word 的「标题 1」
+--   样式往往只是普通 <p>，DOM 里没有 <h1>~<h6>，getToc() 返回 0 条。
+--   于是全书被按页聚合成 1 个大章、再按 256KB 硬切成十几个「（2）（3）」
+--   续篇：nav/ncx 只剩 1 条无意义目录，正文里的「第一卷 / 第X章 /
+--   第X节」也全是普通 <p>，既无目录、也无标题排版。
+--   修复：把提取到的 raw_html 拆成块，用与 .txt 路径完全相同的
+--   chapterTitle / title_level 规则识别章节标题，据此重切章节，生成
+--   真正的多级嵌套目录 + <h1 class="chapter-title lv-N"> 居中标题。
+------------------------------------------------------------------------
+
+-- HTML 片段 -> 纯文本（去标签 + 实体解码 + 折叠空白），仅用于「标题判定」。
+-- 不用 utf8.char：真机 LuaJIT 无该库，且超范围码点在 Lua 5.3 上会抛错。
+local function html_block_text(frag)
+    local t = frag:gsub("<[^>]*>", "")
+    t = t:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+         :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+    local function cp(u)
+        if not u or u ~= u or u < 0 or u > 0x10FFFF
+            or (u >= 0xD800 and u <= 0xDFFF) then
+            return "\239\191\189" -- U+FFFD
+        end
+        return codepoint_to_utf8(u)
+    end
+    t = t:gsub("&#x([%x]+);", function(h) return cp(tonumber(h, 16)) end)
+    t = t:gsub("&#(%d+);", function(d) return cp(tonumber(d, 10)) end)
+    t = t:gsub("%s+", " ")
+    return (t:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- 可切分的块级闭合标签；命中即认为一个「段落块」结束
+local BLOCK_END_TAGS = {
+    p = true, div = true, li = true, tr = true, td = true, blockquote = true,
+    h1 = true, h2 = true, h3 = true, h4 = true, h5 = true, h6 = true,
+}
+local HEADING_LEVEL = { h1 = 1, h2 = 2, h3 = 3, h4 = 4, h5 = 5, h6 = 6 }
+
+-- 把渲染 HTML 拆成 { html=原片段, text=纯文本, heading=<hN> 层级|nil }。
+-- 单次线性扫描所有标签，避免对 2MB+ 正文做 O(n²) 查找。
+local function html_to_blocks(html)
+    local blocks = {}
+    if not html or html == "" then return blocks end
+    -- 先剥离文档级包裹 / <style> / <script>，保证「首个标题块」的文本干净
+    html = sanitize_document_html(html)
+    if html == "" then return blocks end
+    local cuts = {}
+    local pending_heading = nil
+    -- 结尾的 () 捕获的是「标签结束后下一个位置」，故片段右端取 e-1。
+    for s, e in html:gmatch("()<[^>]+>()") do
+        local tag = html:sub(s, e - 1)
+        local close_name = tag:match("^</%s*([%a%d]+)")
+        local open_name = tag:match("^<%s*([%a%d]+)")
+        if close_name then
+            local ln = close_name:lower()
+            if BLOCK_END_TAGS[ln] then
+                cuts[#cuts + 1] = { e = e - 1, heading = HEADING_LEVEL[ln] or pending_heading }
+                pending_heading = nil
+            end
+        elseif open_name then
+            local ln = open_name:lower()
+            if HEADING_LEVEL[ln] then pending_heading = HEADING_LEVEL[ln] end
+        end
+    end
+    -- cre 偶尔返回纯文本 + 换行（无块标签）：按行兜底切分
+    if #cuts == 0 then
+        for s, e in html:gmatch("()[^\r\n]+()") do
+            cuts[#cuts + 1] = { e = e - 1, heading = nil }
+        end
+    end
+    local last = 1
+    local function push(frag, heading)
+        if frag and frag ~= "" then
+            blocks[#blocks + 1] = { html = frag, text = html_block_text(frag), heading = heading }
+        end
+    end
+    for _, c in ipairs(cuts) do
+        if c.e >= last then
+            push(html:sub(last, c.e), c.heading)
+            last = c.e + 1
+        end
+    end
+    if last <= #html then push(html:sub(last), nil) end
+    return blocks
+end
+
+-- 识别到 >= 2 个标题才重切：避免正文里偶然出现一行「第X章」就破坏原结构。
+-- 首个标题之前的正文并入第一章开头（与 .txt 路径 build_chapters 一致）。
+-- 返回 (chapters|nil, 识别到的标题数)
+local function resplit_chapters_by_heading(chapters, book_title)
+    local blocks = {}
+    for _, ch in ipairs(chapters) do
+        if ch.raw_html and ch.raw_html ~= "" then
+            for _, b in ipairs(html_to_blocks(ch.raw_html)) do blocks[#blocks + 1] = b end
+        end
+    end
+    if #blocks == 0 then return nil, 0 end
+
+    -- 标题判定：文本正则优先（含中文数字、卷/章/节多级），其次 DOM 自带 <hN>。
+    -- 限制长度，避免把一整段正文误判为标题。
+    local function heading_of(b)
+        local t = b.text
+        if t == "" or #t > 80 then return nil, nil end
+        if Converter.is_chapter_title(t) then return t, Converter.title_level(t) end
+        if b.heading then return t, b.heading end
+        return nil, nil
+    end
+
+    local hits = 0
+    for _, b in ipairs(blocks) do
+        local t = heading_of(b)
+        if t then hits = hits + 1 end
+    end
+    if hits < 2 then return nil, hits end
+
+    local out = {}
+    local cur = nil
+    local leading = {}
+    local function finish()
+        if cur then
+            cur.raw_html = table.concat(cur.parts)
+            cur.parts = nil
+            out[#out + 1] = cur
+            cur = nil
+        end
+    end
+    for _, b in ipairs(blocks) do
+        local title, level = heading_of(b)
+        if title then
+            finish()
+            cur = { title = title, level = level, parts = {} }
+            -- 首个标题之前的正文并入第一章，不单独生成「前言」章
+            for _, f in ipairs(leading) do cur.parts[#cur.parts + 1] = f end
+            leading = {}
+        elseif b.html and b.html ~= "" then
+            if cur then cur.parts[#cur.parts + 1] = b.html
+            else leading[#leading + 1] = b.html end
+        end
+    end
+    finish()
+    if #out == 0 and #leading > 0 then
+        out[1] = { title = book_title, level = 0, raw_html = table.concat(leading) }
+    end
+    return (#out > 0) and out or nil, hits
+end
+
 function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
     opts = opts or {}
     local indent = opts.indent or "2em"
@@ -1894,6 +2049,22 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
         chapters[#chapters + 1] = { title = book_title, level = 0, raw_html = "" }
     end
 
+    --------------------------------------------------------------------
+    -- 1b) DOM 兜底：从正文 HTML 识别章节标题并重切分。
+    --     真机 .doc 的 getToc() 常为 0 条，若不重切，全书只会变成 1 个
+    --     按 256KB 硬切的大章，nav/ncx 只有 1 条目录且标题完全没有排版。
+    --     只有「重切后章节数明显更多」才替换，避免破坏已有的完整 TOC。
+    --------------------------------------------------------------------
+    local detected_titles, resplit = 0, false
+    do
+        local rebuilt, hits = resplit_chapters_by_heading(chapters, book_title)
+        detected_titles = hits or 0
+        if rebuilt and #rebuilt > #chapters then
+            chapters = rebuilt
+            resplit = true
+        end
+    end
+
     -- 空结果体检：统计所有章节「正文」去掉标签/实体后的可见字符数。
     -- 真机上 CreDocument 对 Word 文档常返回「TOC 仅 1 条 + 单节点 HTML」，
     -- 结果就是一本只剩标题的空书；这里把"疑似空书"量化，交给上层提示用户。
@@ -1909,6 +2080,8 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
         chapter_count = #chapters,
         toc_entries = #toc,
         visible_chars = visible_chars,
+        detected_titles = detected_titles,
+        resplit = resplit,
     }
     -- 让上层能在写盘前就能复用同一判定（也可用 opts.hooks 之外的独立函数）
     stats.empty = Converter.is_empty_document_result(stats)

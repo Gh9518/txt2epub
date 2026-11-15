@@ -12,6 +12,7 @@
 
 ### Highlights
 - **One-tap, any format (v2.0.0)** — `.txt` and `.docx` are parsed by the plugin itself (reliable, full TOC + text); other reader-supported formats (`.doc`/RTF/FB2/EPUB/HTML) use KOReader's parsed document as a fallback, with an empty-result guard instead of silently producing an empty book.
+- **TOC rebuilt from body (v2.0.1)** — when KOReader returns **no TOC** for `.doc`/RTF/FB2 (Word heading styles become plain `<p>`), the plugin detects chapter headings in the extracted body text and rebuilds a real nested TOC + styled `<h1>` headings, instead of one giant 256 KB-split chapter with a single meaningless entry.
 - **Multi-level TOC** — auto-detects 卷/部/册/篇 → 章/回 → 节/集/幕 instead of a flat list.
 - **Typography presets** (Compact / Standard / Relaxed / Custom) baked into `style.css` at conversion time — no resident hooks, zero runtime memory cost.
 - **Streaming, low-memory build** — writes the EPUB chapter-by-chapter and never pre-scans the whole book, so it won't be OOM-killed on memory-tight devices like Kindle.
@@ -62,7 +63,7 @@
 - **多级目录**：卷/部/册/篇 → 章/回 → 节/集/幕 三级嵌套，生成真正的 EPUB3 `nav.xhtml` 与 EPUB2 `toc.ncx`。
 - **排版预设**：紧凑（行距130%）/ 标准（默认，行距155%＋段距0.3em＋首行缩进2字）/ 宽松大字（行距185%＋字号115%）/ 自定义，转换时烘焙进 `style.css`，不装常驻钩子。
 - **本地字体**：列出本机全部已安装字体，菜单按界面语言显示中文名/英文名及样式（粗体·斜体）。
-- **Word 文档**：直接打开 `.docx` 亦可一键转换（菜单同为「工具 › TXT2EPUB」）。章节层级取自 Word 的标题样式（Heading1/2/3… 与 Title），自动生成多级目录、完整正文；插件用纯 Lua 直接解析 OOXML，STORED 与压缩（DEFLATE）docx 均支持，不依赖设备 zlib。旧版 `.doc` 等其它格式由 KOReader 已打开的文档内容兜底转换。
+- **Word 文档**：直接打开 `.docx` 亦可一键转换（菜单同为「工具 › TXT2EPUB」）。章节层级取自 Word 的标题样式（Heading1/2/3… 与 Title），自动生成多级目录、完整正文；插件用纯 Lua 直接解析 OOXML，STORED 与压缩（DEFLATE）docx 均支持，不依赖设备 zlib。旧版 `.doc` 等其它格式由 KOReader 已打开的文档内容兜底转换；**v2.0.1 起**即使 KOReader 未返回目录，也会从正文识别「第一卷 / 第X章 / 第X节」等标题，重切章节并生成嵌套目录与居中标题排版。
 - **超大章节切分**：单章 XHTML 超过 256 KB 自动切分。
 - **墨水屏友好**：`word-break`、`orphans/widows: 2`、`page-break-after: avoid` 等。
 - **稳健识别（借鉴 moon）**：中文数字校验 + 特例标题 + 误判过滤 + 段落回流合并。
@@ -90,8 +91,8 @@
 - 非常规章节写法（如纯日期、自定义符号）需通过「设置章节标题正则」补充 Lua 模式。
 - 纯 Lua Store 方式不压缩，EPUB 体积偏大（兼容性最好）。
 - 缩进模式把每行非空行都当作目录条目，最适合"目录/大纲式"TXT；混有大段散文时建议用显式章节标题或自定义正则。
-- `.doc` / RTF / FB2 / EPUB / HTML 走 **KOReader 已打开文档的 DOM 兜底**，目录层级与正文完整度取决于 KOReader 自身对该格式的解析；若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」——`.docx` 由插件直接解析 OOXML，结果最完整、最稳定。旧版 `.doc`（OLE2 二进制）无法达到 `.docx` 的完整度。
-- 旧版 `.doc` 等 DOM 兜底格式无法在沙箱真机端到端验证（需 KOReader 引擎），请以设备实测为准。
+- `.doc` / RTF / FB2 / EPUB / HTML 走 **KOReader 已打开文档的 DOM 兜底**。KOReader 常把 Word 标题样式渲染成普通 `<p>`、`getToc()` 返回 0 条；**v2.0.1 起插件会自行从正文识别章节标题重切分**，仍能得到多级目录。识别规则与 TXT 路径一致（默认「第X章 / 第X卷 / 第X节」等），可用「章节标题正则」补充；若正文里确实没有任何可识别标题，则退化为按 256 KB 切分、目录仅 1 条。若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」——`.docx` 由插件直接解析 OOXML，结果最完整、最稳定。
+- 旧版 `.doc` 等 DOM 兜底格式的**渲染 HTML 由 KOReader 引擎生成**，沙箱内只能用贴近真机的 mock 验证适配层与重切分逻辑，无法完整复现引擎输出，请以设备实测为准。诊断日志 `.txt2epub.log` 会记录「TOC 条目数 / 正文标题数 / 是否重切分」，便于定位。
 
 ---
 

@@ -216,7 +216,78 @@ if pok then
     check("无 HTML 接口时 converter 安全回退不 panic", eok)
 end
 
+----------------------------------------------------------------------
+-- 6) 真机 .doc 场景：getToc() 返回空表（日志 2026-11-15 11:22:32：
+--    「TOC 条目 0，章节 15」）时，适配层 + converter 全链路仍要生成多级目录
+----------------------------------------------------------------------
+local doc_pages = { {}, {}, {} }
+local function dadd(p, s) local t = doc_pages[p]; t[#t + 1] = s end
+dadd(1, "<html><head><style>p{}</style></head><body>")
+dadd(1, "<p>第一卷 少年时</p>")
+for c = 1, 90 do
+    local pg = (c <= 30) and 1 or (c <= 60) and 2 or 3
+    if c == 31 or c == 61 then dadd(pg, "<html><body>") end
+    dadd(pg, string.format("<p>第%d章 剑起青云</p>", c))
+    for k = 1, 5 do
+        dadd(pg, string.format(
+            "<p>第%d章第%d段正文内容，用于验证按页聚合且无 TOC 时仍能正确重切分并生成多级目录。</p>", c, k))
+    end
+    if c % 30 == 0 then
+        dadd(pg, string.format("<p>第%d节 小结</p>", c / 30))
+        dadd(pg, "<p>本节内容。</p>")
+    end
+end
+dadd(3, "</body></html>")
+for i = 1, 3 do doc_pages[i] = table.concat(doc_pages[i], "\n") end
+
+local notoc_doc = {
+    info = { number_of_pages = 3 },
+    getProps = function() return { title = "big_novel" } end,
+    getToc = function() return {} end,          -- ★ 真机：TOC 条目 0
+    getPageXPointer = function(_, p) return "XP_PAGE_" .. p end,
+    getPageCount = function() return 3 end,
+    getHTMLFromXPointers = function(_, xp0)
+        local n = tonumber((xp0 or ""):match("XP_PAGE_(%d+)")) or 1
+        return doc_pages[n] or ""
+    end,
+    getHTMLFromXPointer = function() return "" end,
+}
+local napi = inst:_build_doc_api(notoc_doc)
+check("真机 .doc：适配层 TOC 为空（如实传递）", #napi.toc == 0, tostring(#napi.toc))
+check("真机 .doc：page_count = 3", napi.page_count == 3, tostring(napi.page_count))
+check("真机 .doc：get_html 可用", type(napi.get_html) == "function")
+check("真机 .doc：end_xp 已解析", type(napi.end_xp) == "string" and napi.end_xp ~= "")
+
+local nout = "/tmp/test_docapi_notoc.epub"
+os.remove(nout)
+local nok, _, ncnt, nstats = pcall(Converter.build_epub_from_document,
+    napi, nout, { book_title = "big_novel" })
+check("真机 .doc：端到端生成 EPUB 不 panic", nok, tostring(ncnt))
+if nok then
+    check("真机 .doc：触发正文标题重切分", nstats and nstats.resplit == true,
+        nstats and tostring(nstats.resplit) or "nil")
+    check("真机 .doc：识别到 >= 90 个标题", nstats and (nstats.detected_titles or 0) >= 90,
+        nstats and tostring(nstats.detected_titles) or "nil")
+    check("真机 .doc：章节数 >= 90（不再是 15 个硬切片）", ncnt >= 90, "got " .. tostring(ncnt))
+    check("真机 .doc：正文非空", nstats and (nstats.visible_chars or 0) > 1000,
+        nstats and tostring(nstats.visible_chars) or "nil")
+    os.execute("rm -rf /tmp/test_docapi_notoc_unzip && mkdir -p /tmp/test_docapi_notoc_unzip")
+    os.execute("cd /tmp/test_docapi_notoc_unzip && unzip -o -q " .. nout .. " >/dev/null 2>&1")
+    local nnf = io.open("/tmp/test_docapi_notoc_unzip/OEBPS/nav.xhtml", "r")
+    if nnf then
+        local nnav = nnf:read("*a"); nnf:close()
+        check("真机 .doc：nav 含卷标题「第一卷 少年时」", nnav:find("第一卷 少年时", 1, true) ~= nil)
+        check("真机 .doc：nav 含首章「第1章 剑起青云」", nnav:find("第1章 剑起青云", 1, true) ~= nil)
+        check("真机 .doc：nav 含末章「第90章 剑起青云」", nnav:find("第90章 剑起青云", 1, true) ~= nil)
+        check("真机 .doc：nav 含节标题「第1节 小结」", nnav:find("第1节 小结", 1, true) ~= nil)
+        check("真机 .doc：nav 不再是单条书名", nnav:find(">big_novel<", 1, true) == nil)
+    else
+        check("真机 .doc：nav.xhtml 存在", false)
+    end
+end
+
 os.remove("/tmp/test_docapi.epub"); os.remove("/tmp/test_docapi_pdf.epub")
-os.execute("rm -rf /tmp/test_docapi_unzip")
+os.remove("/tmp/test_docapi_notoc.epub")
+os.execute("rm -rf /tmp/test_docapi_unzip /tmp/test_docapi_notoc_unzip")
 print(string.format("\n=== test_docapi：%d 通过, %d 失败 ===", passes, fails))
 os.exit(fails == 0 and 0 or 1)
