@@ -421,6 +421,10 @@ local function read_impl(path)
     self.data = nil
     zip.data = nil
     data = nil
+    -- LuaJIT 对「大字符串 + 用过的 Huffman 临时表」常需两轮全量回收才真正
+    -- 归还堆：真机连续转换时若只回收一轮，DEFLATE docx 解压峰值会残留，
+    -- 多次叠加后触发内核 OOM（crash.log 只有 Killed、无 Lua 堆栈）。
+    collectgarbage("collect")
     collectgarbage("collect")
     return { title = title, paragraphs = paragraphs }
 end

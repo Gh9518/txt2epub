@@ -365,7 +365,17 @@ function Converter._decode_tmp(path, enc)
     if not rfh then
         return false
     end
+    local sz = rfh:seek("end")
     rfh:close()
+    -- iconv 不可用 / 解码失败时，shell 重定向仍会创建一个「空」的 out 文件。
+    -- 若不判空就把它当作解码结果返回，lines() 会读到空内容 → 生成空书，
+    -- 并在源文件目录残留一个空临时文件。这里删除空文件并返回 false，
+    -- 让 lines() 回退为「按原始字节流式读」（内存有界、不崩溃、不空书），
+    -- 与 README「设备无 iconv 时按原始字节处理」的承诺一致。
+    if not sz or sz == 0 then
+        pcall(os.remove, out)
+        return false
+    end
     return out
 end
 
@@ -434,10 +444,13 @@ end
 
 -- 转换结束时调用：删除解码临时文件并清缓存（pcall 守护，失败不影响转换结果）
 function Converter.release_lines(path)
-    if _decoded_cache[path] then
-        pcall(os.remove, _decoded_cache[path])
-        _decoded_cache[path] = nil
+    local cached = _decoded_cache[path]
+    if cached then
+        pcall(os.remove, cached)
     end
+    -- 无论缓存的是临时路径还是 false（原生 UTF-8），都要清除条目：
+    -- 否则连续转换大量不同文件时 false 项永久累积（内存 + 表膨胀）。
+    _decoded_cache[path] = nil
 end
 
 -- 读取整个文件并解码为 UTF-8 文本（用于回退场景：整本书作一章）
@@ -659,14 +672,29 @@ end
 local LV_MARKERS = { ["卷"] = 0, ["部"] = 0, ["册"] = 0, ["篇"] = 0,
                      ["章"] = 1, ["回"] = 1,
                      ["节"] = 2, ["集"] = 2, ["幕"] = 2 }
+
+-- Unicode 罗马数字（U+2160..U+216B ⅠⅡⅢ…Ⅻ）归一化为 ASCII，
+-- 让「Part Ⅱ」「Chapter Ⅳ」这类写法也能被 isNumberToken / title_level 识别。
+local ROMAN_UNICODE = {
+    ["\226\133\160"] = "I",   ["\226\133\161"] = "II",  ["\226\133\162"] = "III",
+    ["\226\133\163"] = "IV",  ["\226\133\164"] = "V",   ["\226\133\165"] = "VI",
+    ["\226\133\166"] = "VII", ["\226\133\167"] = "VIII",["\226\133\168"] = "IX",
+    ["\226\133\169"] = "X",   ["\226\133\170"] = "XI",  ["\226\133\171"] = "XII",
+}
+
 local function title_level(line)
     line = trim(line)
     line = line:gsub("^=+%s*", ""):gsub("%s*=+$", "")
     -- 英文标记优先（用 %w 确保后面确实跟了内容，避免误判）
-    if line:match("^[Vv]olume%s+%w") or line:match("^[Bb]ook%s+%w") then
+    -- Part / Volume / Book 为卷级(0)；Chapter 为章级(1)；Section 为节级(2)。
+    -- Unicode 罗马数字（Ⅰ Ⅱ …）先转 ASCII 再判定。
+    local ascii_line = line
+    for u, a in pairs(ROMAN_UNICODE) do ascii_line = ascii_line:gsub(u, a) end
+    if ascii_line:match("^[Vv]olume%s+%w") or ascii_line:match("^[Bb]ook%s+%w")
+        or ascii_line:match("^[Pp]art%s+%w") then
         return 0
     end
-    if line:match("^[Ss]ection%s+%w") then
+    if ascii_line:match("^[Ss]ection%s+%w") then
         return 2
     end
     if line:match("^[Cc]hapter%s+%w") then
@@ -765,6 +793,7 @@ end
 -- 字符串是否为“数字型标记”（阿拉伯数字 / 罗马数字 / 中文数字）
 local function isNumberToken(value)
     value = value:gsub("%s+", "")
+    for u, a in pairs(ROMAN_UNICODE) do value = value:gsub(u, a) end
     if value == "" then return false end
     if value:match("^%d+$") or value:match("^[IVXLCDMivxlcdm]+$") then return true end
     local rest = value
@@ -774,15 +803,95 @@ local function isNumberToken(value)
     return rest == ""
 end
 
+-- 标题落盘到 nav/ncx 与 <h1> 前使用的“显示文本”清理：
+--   * 去首尾空白
+--   * 剥离 === / —— 等包裹符（如「=== 第4章 风起 ===」→「第4章 风起」），
+--     否则目录里会出现多余的「===」（真机 title_punct.txt 反馈）。
+-- 注意：不做 normalize_title_ws —— 保留原文里的 U+3000 全角空格，
+--      与「目录文本保留原文」的既有承诺一致。
+local function clean_title_text(line)
+    line = trim(line or "")
+    line = line:gsub("^=+%s*", ""):gsub("%s*=+$", "")
+    return trim(line)
+end
+function Converter.clean_title_text(line)
+    return clean_title_text(line)
+end
+
 -- 判断一行是否为章节标题（返回标题字符串或 nil）；参考 moon.koplugin/chapterTitle
 local function chapterTitle(line)
     line = trim(normalize_title_ws(line or ""))
     -- 常见 TXT 用 === 包裹标题：仅剥离等号，避免吞掉正文
     line = line:gsub("^=+%s*", ""):gsub("%s*=+$", "")
-    if line:match("^[Cc]hapter%s+[%w]+")
-        or line:match("^[Ss]ection%s+[%w]+")
-        or line:match("^[Pp]age%s+%d+") then
+    -- 英文：Chapter / Section / Part / Volume / Book + 序号；Page + 数字。
+    -- 关键修复（big_english.txt 误判）：正文行以「Chapter N paragraph K.」开头，
+    -- 旧规则 ^Chapter%s+[%w]+ 会把 4500 段正文当成章节。这里要求序号之后的
+    -- 剩余部分必须“像标题”——即行末、空白+标点、或空白+较短标题；若剩余内容是
+    -- 一个完整句子（含 . 后跟空格且很长）则以正文论处，直接拒绝。
+    local en_key, en_rest = line:match("^([Cc]hapter)%s+[%w]+(.*)$")
+    if not en_key then en_key, en_rest = line:match("^([Ss]ection)%s+[%w]+(.*)$") end
+    if not en_key then en_key, en_rest = line:match("^([Bb]ook)%s+%w+(.*)$") end
+    -- Part / Volume 的序号可能是 Unicode 罗马数字（Ⅱ=多字节，%w 匹配不到），
+    -- 故单独按「到首个空白」取 token 再校验。
+    if not en_key then
+        local pkey, prest = line:match("^([Pp]art)%s+(%S+.*)$")
+        if not pkey then pkey, prest = line:match("^([Vv]olume)%s+(%S+.*)$") end
+        if pkey and prest then
+            local tok = prest:match("^(%S+)")
+            if tok and isNumberToken(tok) then en_key, en_rest = pkey, prest end
+        end
+    end
+    if en_key then
+        en_rest = en_rest or ""
+        -- 正文句子特征：序号后紧跟段落词（paragraph/para/section/chapter 后跟数字），
+        -- 或出现「单词. + 空格 + 词」结构（如 "Chapter 5 paragraph 3. The wind..."），
+        -- 或整行过长（>80 字节）。这些都判为正文，避免 big_english.txt 4500 段误判。
+        local body_word = en_rest:match("^%s+[Pp][Aa][Rr][Aa]")
+            or en_rest:match("^%s+[Pp][Aa][Rr][Aa][Gg][Rr][Aa][Pp][Hh]")
+            or en_rest:match("^%s+[Ss]ection%s+%d")
+            or en_rest:match("^%s+[Cc]hapter%s+%d")
+        local sentence_like = (#line > 80)
+            or body_word ~= nil
+            or en_rest:match("%w+%.%s+%S") ~= nil
+            or en_rest:match("^%s*%w+%.%s") ~= nil
+        if not sentence_like then return line end
+    end
+    if line:match("^[Pp]age%s+%d+") then
         return line
+    end
+    -- 中文：允许「第一章开端」这类无分隔符标题（title_no_separator.txt 反馈）。
+    -- 判定：第X章/回/节/集/幕/卷/部/篇 后直接跟内容也算标题，但必须：
+    --   ① 整行较短（≤ 40 字节，约 13 汉字）；② 后缀是标题式短语——不含句末标点，
+    --   且不以「的/了/和/在/是/有/中/里/上/下」等常见正文虚词开头，
+    --   也不含「内容/故事/时候」这类正文高频收尾。避免把「第二回的内容慢慢展开」
+    --   「第一部门的故事」误判为标题。
+    if line:sub(1, 3) == "第" then
+        local no_sep = false
+        local FUNC_LEAD = { "的", "了", "和", "在", "是", "有", "中", "里", "上", "下", "地", "得" }
+        for _i, marker in ipairs({ "章", "回", "节", "集", "幕", "卷", "部", "篇" }) do
+            local number, suffix = line:match("^第%s*(.-)%s*" .. marker .. "(.*)$")
+            if number and not no_sep and isNumberToken(number) and suffix and suffix ~= "" then
+                if #line <= 40 then
+                    local lead = suffix:sub(1, 3)
+                    local bad_lead = false
+                    for _j, fw in ipairs(FUNC_LEAD) do
+                        if lead:sub(1, #fw) == fw then bad_lead = true; break end
+                    end
+                    -- 首字节非 ASCII（中文）；且不以虚词开头（虚词开头多为正文接续）；
+                    -- 「第一部门/部队」是正文（INVALID_VOLUME_SUFFIX），不是「第一部」。
+                    local bad_volume = (marker == "部" and INVALID_VOLUME_SUFFIX[suffix:sub(1, 3)] ~= nil)
+                    -- suffix 以另一章节标记字开头（如「第3章节选段落」的「节选」）多为正文描述
+                    local sfirst = suffix:sub(1, 3)
+                    local bad_suffix_lead = (LV_MARKERS[sfirst] ~= nil)
+                        or suffix:match("^节选") ~= nil or suffix:match("^摘录") ~= nil
+                    if suffix:sub(1, 1):match("[%z\1-\127]") == nil
+                        and not bad_lead and not bad_volume and not bad_suffix_lead then
+                        no_sep = true
+                    end
+                end
+            end
+        end
+        if no_sep then return line end
     end
     if line:sub(1, 3) == "第" then
         for _i, marker in ipairs({ "章", "回", "节", "集", "幕", "卷", "部", "篇" }) do
@@ -960,15 +1069,17 @@ local function build_chapters(line_iter, patterns, book_title)
     local line = line_iter()
     while line ~= nil do
         if is_title_line(line, patterns) then
+            -- 目录/正文标题统一剥离「===」等包裹符（title_punct.txt 反馈）
+            local ctitle = clean_title_text(line)
             if not seen_title then
                 -- 首个标题：把前置正文并入本章开头
                 if leading then flush_into(leading) end
-                current = { title = trim(line), paras = leading and leading.paras or {}, level = Converter.title_level(line), children = {} }
+                current = { title = ctitle, paras = leading and leading.paras or {}, level = Converter.title_level(ctitle), children = {} }
                 leading = nil
                 seen_title = true
             else
                 close_current()
-                current = { title = trim(line), paras = {}, level = Converter.title_level(line), children = {} }
+                current = { title = ctitle, paras = {}, level = Converter.title_level(ctitle), children = {} }
             end
         else
             if seen_title then
@@ -1478,6 +1589,10 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
     -- 仅首个分片计入目录，其余为续篇（不入目录但进入正文流）。
     -- 参考 moon.koplugin 的稳定性做法：避免单文件过大导致阅读器渲染卡顿/崩溃。
     local MAX_CHAPTER_BYTES = 256 * 1024
+    -- 每段 XHTML 包装开销上界：<p>\n…\n</p>\n 约 9 字节 + XML 转义预留。
+    -- 分片累加必须计入它，否则「原始文本刚好 256KB」的章生成后会被包装
+    -- 撑到 264KB+（真机 .docx 曾产出 279927 字节单章）。
+    local XHTML_PARA_OVERHEAD = 64
 
     -- 写出一章：立即写入 ZIP 后释放该章正文（内存只保留一章量级）。
     -- paras 为“每行一段纯文本”的字符串数组（已做段落回流合并）。
@@ -1509,11 +1624,12 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
                 if i % 5 == 0 then collectgarbage("collect") end
             end
             for _, p in ipairs(paras) do
-                if size > 0 and size + #p + 64 > MAX_CHAPTER_BYTES then
+                local cost = #p + XHTML_PARA_OVERHEAD
+                if size > 0 and size + cost > MAX_CHAPTER_BYTES then
                     flush_part()
                 end
                 chunk[#chunk + 1] = p
-                size = size + #p
+                size = size + cost
             end
             flush_part()
         else
@@ -1604,7 +1720,10 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
         local function close_current()
             if current then
                 flush_into(current)
-                emit(current.title, current.paras, 0)
+                -- 修复：沿用创建章节时算好的层级，而非硬编码 0。
+                -- 旧实现把所有章节 level 压成 0，导致 TXT 多级目录（卷/章/节）
+                -- 在 nav/ncx 中全部平铺、"不折叠"。
+                emit(current.title, current.paras, current.level or 0)
                 current = nil
             end
         end
@@ -1612,14 +1731,15 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
         local line = line_iter()
         while line ~= nil do
             if is_title_line(line, patterns) then
+                local ctitle = clean_title_text(line)  -- 剥离「===」等包裹符
                 if not seen_title then
                     if leading then flush_into(leading) end
-                    current = { title = trim(line), paras = leading and leading.paras or {}, level = Converter.title_level(line) }
+                    current = { title = ctitle, paras = leading and leading.paras or {}, level = Converter.title_level(ctitle) }
                     leading = nil
                     seen_title = true
                 else
                     close_current()
-                    current = { title = trim(line), paras = {}, level = Converter.title_level(line) }
+                    current = { title = ctitle, paras = {}, level = Converter.title_level(ctitle) }
                 end
             else
                 if seen_title then
@@ -1631,6 +1751,13 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
                 end
             end
             line = line_iter()
+        end
+        -- 收尾 flush：全文无标题时正文都在 leading 里，而 flush_into(leading)
+        -- 只在「遇到空行」时触发；若文件末尾没有空行（例如整本是一行 744KB
+        -- 的纯正文），buffer 中的残留行会在这里被静默丢弃，最终只产出空章。
+        -- 有标题时 close_current() 会自行 flush_into(current)，无需重复处理。
+        if not current and leading then
+            flush_into(leading)
         end
         close_current()
         if leading and #leading.paras > 0 then
@@ -1667,6 +1794,78 @@ end
 --   hooks    : { on_yield, on_progress }（同 build_epub_streaming）
 --   返回：true, count（EPUB 章节文件数）
 ------------------------------------------------------------------------
+-- 9d-0. 从正文文本恢复章节标题（.docx 专用兜底，纯函数、无 IO）
+--   背景（真机日志 2026-11-15 17:17:12，big_novel_STORED.docx）：
+--     「EPUB 生成成功（Word），共 9 章」但目录严重不全。
+--   根因：设备上那份 .docx 的 Word 标题样式（w:pStyle / w:outlineLvl）在
+--   KOReader 打开/另存后丢失或未被识别，DocxReader 得到 heading=0；于是
+--   6960 个正文段全被并入「首个标题之前的正文」，聚成一个 2.2MB 超大章：
+--     (a) 旧 emit 先拼出 2.2MB 整串，叠加 KOReader 已打开的 docx DOM ->
+--         内核 OOM killer（16:52 那次 crash.log 只有 Killed、无 Lua 堆栈）；
+--     (b) 再按 256KB 硬切成 9 片、且只有首片进目录 -> nav/ncx 仅 1 条。
+--   .doc 走 DOM 路径早有「从正文文本重切标题」兜底（真机识别 364 标题、
+--   生成 370 章，正常），故问题只在 docx 自解析路径。
+--
+--   策略：仅当「Word 样式标题缺失或严重不足」时启用，把正文中「短段落 +
+--   命中 chapterTitle 规则」的段落提升为 heading（层级用 title_level，与
+--   .txt / DOM 路径完全一致）。短段阈值 80 字节：真机正文段 373 字节、
+--   标题段约 20 字节，可精准区分，不会把正文误判成标题。
+--   返回 stats 供上层写诊断日志，便于真机直接判断是否生效。
+------------------------------------------------------------------------
+local RECOVER_TITLE_MAX_BYTES = 80
+
+function Converter.recover_docx_headings(paragraphs, opts)
+    opts = opts or {}
+    local stats = {
+        word_headings = 0, text_titles = 0, promoted = 0,
+        enabled = false, mode = "word-style", body_paras = 0,
+    }
+    if type(paragraphs) ~= "table" or #paragraphs == 0 then
+        return paragraphs, stats
+    end
+    local n = #paragraphs
+    -- 1) 统计 Word 样式标题
+    for k = 1, n do
+        local p = paragraphs[k]
+        if p and p.kind == "heading" then
+            stats.word_headings = stats.word_headings + 1
+        end
+    end
+    -- 2) 找正文里的「短段落标题候选」（只记录下标，先不改）
+    local cand = {}
+    for k = 1, n do
+        local p = paragraphs[k]
+        if p and p.kind ~= "heading" and p.text and p.text ~= "" then
+            stats.body_paras = stats.body_paras + 1
+            local t = trim(p.text)
+            if #t > 0 and #t <= RECOVER_TITLE_MAX_BYTES
+                and Converter.is_chapter_title(t) then
+                cand[#cand + 1] = { idx = k, level = Converter.title_level(t) }
+            end
+        end
+    end
+    stats.text_titles = #cand
+    -- 3) 触发条件：样式标题为 0，或文本候选远多于样式标题（样式严重缺失）
+    local need = (stats.word_headings == 0 and #cand >= 3)
+        or (#cand >= 3 and #cand > stats.word_headings * 2)
+    if opts.no_title_recovery or not need then
+        return paragraphs, stats
+    end
+    -- 4) 提升：把候选正文段就地改成 heading（保留原文本作为章标题）
+    for _, c in ipairs(cand) do
+        local p = paragraphs[c.idx]
+        if p then
+            p.kind = "heading"
+            p.level = c.level
+            stats.promoted = stats.promoted + 1
+        end
+    end
+    stats.enabled = true
+    stats.mode = (stats.word_headings == 0) and "text-only" or "text-merged"
+    return paragraphs, stats
+end
+
+------------------------------------------------------------------------
 -- 「段落序列 -> EPUB」统一流水线。
 --   .docx / .html / .htm / .md 先各自解析成同样的段落序列：
 --     { {kind="heading", level=N, text=T} | {kind="body", text=T}, ... }
@@ -1687,43 +1886,53 @@ function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, 
 
     local toc = {}
     local i = 0
+    local split_parts = 0
     local MAX_CHAPTER_BYTES = 256 * 1024
+    -- 每段 XHTML 包装开销上界：估算必须计入，否则 180 段的章按原始文本
+    -- 切到 256KB、生成后被 <p></p> 撑到 264KB+（真机 docx 279927 字节）。
+    local XHTML_PARA_OVERHEAD = 64
 
+    -- 低内存安全的分片写出：先按「累计字节」估算整章体积，超限时直接按段
+    -- 切成 <=256KB 的 chunk、逐片生成 XHTML 写盘，绝不先 table.concat 出整章
+    -- 大字符串。真机 docx 样式丢失时曾把 2.2MB 正文一次性拼成单个 XHTML，
+    -- 叠加 KOReader 已打开的 docx DOM 直接触发内核 OOM killer（crash.log 只有
+    -- Killed、无 Lua 堆栈）。每个分片都进目录，避免「共 9 章但 nav 仅 1 条」。
     local function emit(title, paras, level)
         level = level or 0
         -- 单段超长保护：一整章写在同一段时，先把 >256KB 的段落按 UTF-8 边界
-        -- 拆成 64KB 子段，让下面的按段切分真正生效，避免产出单个 500KB+ 的
-        -- XHTML（Kindle indexer / 渲染卡顿、甚至重启的已知诱因）。
+        -- 拆成 64KB 子段，让下面的按段切分真正生效。
         paras = expand_long_paras(paras, MAX_CHAPTER_BYTES, 64 * 1024)
         i = i + 1
-        local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
-        if #xhtml > MAX_CHAPTER_BYTES and #paras > 1 then
-            local chunk = {}
-            local size = 0
-            local part = 1
+        local approx = 0
+        for k = 1, #paras do approx = approx + #paras[k] + XHTML_PARA_OVERHEAD end
+        if approx > MAX_CHAPTER_BYTES and #paras > 1 then
+            local chunk, size, part = {}, 0, 1
             local function flush_part()
                 if #chunk == 0 then return end
                 local t = (part == 1) and title or (title .. "（" .. part .. "）")
                 local px = Converter.build_chapter_xhtml(t, chunk, indent, level)
                 local fname = string.format("OEBPS/chapter_%04d%s.xhtml", i, (part == 1) and "" or ("_" .. part))
                 zip:add(fname, px)
-                toc[#toc + 1] = { file = fname, title = t, level = level, toc = (part == 1) }
+                toc[#toc + 1] = { file = fname, title = t, level = level, toc = true }
+                split_parts = split_parts + 1
                 part = part + 1
-                chunk = {}
-                size = 0
+                chunk, size = {}, 0
                 if hooks and type(hooks.on_yield) == "function" then hooks.on_yield() end
                 if hooks and type(hooks.on_progress) == "function" then hooks.on_progress(i, nil) end
                 if i % 5 == 0 then collectgarbage("collect") end
             end
-            for _, p in ipairs(paras) do
-                if size > 0 and size + #p + 64 > MAX_CHAPTER_BYTES then
+            for k = 1, #paras do
+                local p = paras[k]
+                local cost = #p + XHTML_PARA_OVERHEAD
+                if size > 0 and size + cost > MAX_CHAPTER_BYTES then
                     flush_part()
                 end
                 chunk[#chunk + 1] = p
-                size = size + #p
+                size = size + cost
             end
             flush_part()
         else
+            local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
             local fname = string.format("OEBPS/chapter_%04d.xhtml", i)
             zip:add(fname, xhtml)
             toc[#toc + 1] = { file = fname, title = title, level = level, toc = true }
@@ -1806,13 +2015,15 @@ function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, 
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     collectgarbage("collect")
-    return true, #toc
+    return true, #toc, { chapter_count = #toc, split_parts = split_parts }
 end
 
 ------------------------------------------------------------------------
 -- 9d-1a. Word(.docx) 入口：读 OOXML -> 段落序列 -> 统一流水线
 ------------------------------------------------------------------------
 function Converter.build_epub_from_docx(path, out_path, opts, hooks)
+    opts = opts or {}
+    hooks = hooks or {}
     local ok, DocxReader = pcall(require, "docx")
     if not ok or not DocxReader then
         error("无法加载 docx 解析模块（docx.lua 缺失）")
@@ -1821,12 +2032,25 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
     if not doc then
         error("读取 Word 文档失败：" .. tostring(derr))
     end
-    local book_title = doc.title or (opts and opts.book_title) or "未命名"
+    local book_title = doc.title or opts.book_title or "未命名"
     local paragraphs = doc.paragraphs or {}
     doc.paragraphs = nil
     doc = nil
     collectgarbage("step")
-    return Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, opts, hooks)
+
+    -- 兜底：Word 样式标题缺失时从正文文本恢复（详见 9d-0 注释）。
+    -- 统计通过 hooks.on_diag 回传，由 main.lua 写入 .txt2epub.log。
+    local rst
+    paragraphs, rst = Converter.recover_docx_headings(paragraphs, opts)
+    if type(hooks.on_diag) == "function" then
+        pcall(hooks.on_diag, rst)
+    end
+
+    local bok, cnt, stats = Converter.build_epub_from_paragraphs(
+        paragraphs, book_title, out_path, opts, hooks)
+    stats = stats or {}
+    stats.recovery = rst
+    return bok, cnt, stats
 end
 
 ------------------------------------------------------------------------
@@ -2107,7 +2331,8 @@ local function resplit_chapters_by_heading(chapters, book_title)
         local title, level = heading_of(b)
         if title then
             finish()
-            cur = { title = title, level = level, parts = {} }
+            local ct = clean_title_text(title)
+            cur = { title = ct, level = (Converter.title_level(ct) ~= nil and Converter.title_level(ct) or level), parts = {} }
             -- 首个标题之前的正文并入第一章，不单独生成「前言」章
             for _, f in ipairs(leading) do cur.parts[#cur.parts + 1] = f end
             leading = {}
@@ -2182,7 +2407,8 @@ local function resplit_by_plain_text(chapters, book_title)
     for _, t in ipairs(lines) do
         if title_of(t) then
             finish()
-            cur = { title = t, level = Converter.title_level(t), parts = {} }
+            local ct = clean_title_text(t)
+            cur = { title = ct, level = Converter.title_level(ct), parts = {} }
             for _, f in ipairs(leading) do cur.parts[#cur.parts + 1] = f end
             leading = {}
         else

@@ -2,6 +2,71 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.3（2026-11-16）
+
+全量代码自测（静态校验 + 20 套件双解释器回归 + 62 文件双解释器端到端 + EPUB XML 良构性 + 正文完整性）中发现并修复一个**静默正文丢失**缺陷。
+
+### 修复：TXT 全文无标题时正文被静默丢弃
+- 现象：`05_edges/edge_no_title.txt`（744 KB、整本一行、无任何标题与换行）转换后只产出 1 个 **358 字节空章**，744 KB 正文全部丢失；而既有验证只检查目录条数 / 单章大小 / zip 完整性，`nav=1` 即判通过，缺陷长期未被发现。
+- 根因：`build_epub_streaming()` 标题模式把「第一个标题之前的正文」放在 `leading` 容器里，而 `flush_into(leading)` **只在遇到空行时触发**；循环结束后缺少收尾 flush，末尾没有空行时 `buffer` 中的残留行被丢弃，`leading.paras` 为空，最终只 emit 空章。
+- 修复：循环结束后、`close_current()` 之前，若 `current` 为 nil 且 `leading` 存在，补一次 `flush_into(leading)`。有标题的路径由 `close_current()` 自行 flush，不受影响。
+- 修复后：该样本生成 **4 个 XHTML 分片**（最大 197001 字节 / 192 KB），正文中文字符 **232000 与源文件完全守恒**，nav/ncx=1（仅首片进目录，属已记录观察项），Lua 5.3 / LuaJIT 一致。
+- 新增回归 `test/test_notitle_flush.lua`（**18 项 × 双解释器**）：覆盖单行超长无标题、多行末尾无空行、末尾有空行护栏、有标题末尾无空行、空文件 / 纯空行、临时文件清理；用「中文字符守恒 + 特征短语」验证，**不依赖目录条数**，避免同类漏检再次发生。
+
+### 自测与校验方法补强
+- 静态：双编译器语法检查（25 个 Lua 文件）、4 个纯 Lua 模块导出 API 契约、跨模块调用-定义交叉核对（同时识别 `function X` 与 `X = function` 两种定义形式）、交付包 8 文件 SHA-256 一致性。
+- 动态 EPUB：全部产出 EPUB 的 XHTML / OPF / NCX / XML 良构性、`container.xml` 与 `content.opf` 的 manifest / spine 引用完整性、nav 与 ncx 条目数一致、未入目录分片精确对账、按段落取中文骨架指纹验证正文无截断。
+- 交叉核对时发现 `DocxReader._entry_reader` 是**可选测试注入钩子**（有 `if ... then` 存在性守卫），非运行时缺陷，已在校验脚本中显式列示而非静默放过。
+
+## v2.1.2（2026-11-15）
+
+真机日志（`crash.log` / `txt2epub.log`，用户第二轮反馈）暴露三个问题，全部修复并全格式回归。
+
+### 1. 修复：同名不同格式输出互相覆盖
+- 现象：`big_novel.txt / .docx / .html / .md` 全部输出成 `big_novel.epub`（日志 21:34/21:36/21:38/21:43），后转换的覆盖先转换的，还产生半成品 EPUB，触发 `CRE WARNING: zip file corrupted or invalid`。
+- 修复：新增 `TXT2EPUB.output_name_with_ext(base, ext)`，输出名按源格式加小标记：`big_novel_txt.epub` / `big_novel_docx.epub` / `big_novel_html.epub` / `big_novel_md.epub` / `big_novel_doc.epub`。DOM 兜底路径同样加标记。已带标记则不重复追加，大小写归一。
+
+### 2. 修复：超长章节拆分不够（各格式）
+- 现象：真机 `.docx` 单章达 **279927 字节（273KB）**，超过 256KB 阈值；`Kindle indexer` 卡顿诱因。
+- 根因：分片累加只用「原始段落文本字节」，未计 `build_chapter_xhtml` 每段 `<p>\n</p>\n` 包装与转义开销（约 9~40 字节/段）。180 段的章按原始字节切到 256KB，生成 XHTML 后被撑到 263KB+。
+- 修复：三套 emit（streaming / paragraphs / DOM raw）统一按「段落实际输出开销」估算与累加（每段预留 64 字节）；docx/TXT/MD/HTML 各格式超长章样本均验证单章严格 <256KB（基线最大 244696 字节，239KB）。所有分片继续全部进目录。
+
+### 3. 修复：TXT 目录不折叠 + 连续转换崩溃
+- 目录不折叠：`build_epub_streaming` 标题模式 `close_current()` 把章节 level 硬编码为 0，丢弃创建时算好的卷(0)/章(1)/节(2)层级，nav/ncx 全平铺。改为沿用 `current.level`，多级目录正确嵌套折叠（单测验证 nav 多个 `<ol>`、节级标题入目录）。
+- 连续转换崩溃：日志中连续转换 8 个大文件后 `Killed`（内核 OOM，无 Lua 堆栈）。`_async_run` 在成功/失败收尾都做双重 `collectgarbage("collect")` 并断开协程/结果引用；`docx.lua` 解压释放后双重回收；`Converter.release_lines()` 无条件清除解码缓存条目（含原生 UTF-8 的 `false` 值，避免连续转换累积）。
+
+### 验证
+- 新增 `test_v212.lua`（31 项，覆盖输出名契约、各格式超长章拆分、TXT 目录折叠、连续转换内存），Lua 5.3 / LuaJIT 双解释器全通过。
+- 全量回归约 19 套件 × 双解释器 0 失败；连续 8 次真实大文件（STORED.docx/html/txt/md/DEFLATE.docx）压力测试全部成功，插件侧堆稳定不无限增长。
+- 说明：真机 OOM 主因是 KOReader 打开 docx 的 DOM 缓存渲染（日志中每次 opening 6~8 秒）叠加 Kindle 有限内存；插件侧已将自身内存与分片体积压到最低并稳定，无法消除 KOReader 原生 DOM 的占用。
+
+## v2.1.1（2026-11-15）
+### 修复：大 `.docx` 转换「目录不全（共 9 章）」与「OOM 被 Killed」
+
+真机日志（`crash.log` / `txt2epub.log`，`big_novel_STORED.docx`）：
+- `16:52:33 开始由 Word 生成 EPUB` 后无成功行，`crash.log` 第 204 行只有 `Killed`（内核 OOM killer，无 Lua 堆栈），KOReader 直接退出。
+- `17:17:12 EPUB 生成成功（Word），共 9 章` —— 但目录严重不全。
+- 对照同一次会话 `17:03:21` 转换 `big_novel.doc` 成功 **370 章**（正文标题 364、重切分是），说明 `.doc`/DOM 路径正常，问题只在 `.docx` 自解析路径。
+
+**根因**（沙箱精确复现）：设备上那份 `.docx` 的 Word 标题样式（`w:pStyle` / `outlineLvl`）丢失或未被识别，`DocxReader` 得到 `heading=0`。把测试文件去掉 `<w:pStyle>` 后，双解释器均复现「**9 章、nav 仅 1 条**」，与真机一致。旧流水线两个缺陷同时爆发：
+1. `build_epub_from_paragraphs()` 的 `emit()` 先 `table.concat` 出**整章 2.2 MB 大字符串**，叠加 KOReader 已打开的 docx DOM（crash.log 里 `rendering took 6.5 s`），在 Kindle 低内存上触发 OOM `Killed`；
+2. 6960 个正文段全聚成 1 个大章，按 256 KB 硬切成 9 片，且 `toc=(part==1)` 只让首片进目录 → `nav.xhtml` / `toc.ncx` 仅 1 条 →「共 9 章、目录不全」。
+而 `.doc` 走 DOM 路径早有「从正文文本重切标题」兜底（`resplit_chapters_by_heading`），故正常 —— 这个能力此前没补到 docx 自解析路径。
+
+**修复**（`converter.lua` / `main.lua`）：
+- 新增 `Converter.recover_docx_headings()`：仅当 Word 样式标题缺失或严重不足（为 0，或文本候选 > 样式标题 ×2）时，把正文中「短段落（≤80 字节，真机正文段 373 字节 / 标题段约 20 字节）+ 命中 `is_chapter_title`」的段落提升为 `heading`，层级用 `title_level`（与 `.txt`/DOM 路径完全一致）。标准 Word 样式文档完全不改动（护栏测试确认）。
+- `emit()` 改为**先按累计字节估算、超限直接按段分片逐片写盘**，绝不先拼整章大字符串；**每个分片都进目录**（旧实现只让首片进）。这同时消除 OOM 峰值与「硬切 9 片只有 1 条目录」。
+- `build_epub_from_docx()` 通过 `hooks.on_diag` / 第三个返回值回传标题体检统计；`main.lua` 在 `.txt2epub.log` 新增一行「Word 标题体检：样式标题 N，正文段 N，文本候选标题 N，兜底重切 是/否（提升 N，模式 …）」，真机可直接判断是否生效。
+
+**验证**：
+- 真机场景复现（去样式 `big_novel_STORED.docx`）：从「**9 章 / nav 1 条**」变为「**367 章 / nav 367 条 / 三级嵌套目录**」，与标准样式版章节数完全一致；峰值内存 LuaJIT 21 MB / Lua 5.3 28 MB，耗时 0.36–0.70 s。
+- 纯正文零标题大 docx（OOM 兜底）：10 个分片**全部进目录**、单章 XHTML < 300 KB、不 panic。
+- 新增 `test_docx_notoc.lua`（45 项，覆盖纯函数 8 组 + 端到端无样式/标准样式/纯正文大书 + 标准样式护栏）。全套 **533 项 × Lua 5.3 / LuaJIT 双解释器通过、0 失败**（18 套件）。过程中修正测试样本 `c/4` 在 Lua 5.3 产生浮点 `1.0` 导致 `第1.0节` 漏识别的问题（双解释器验证抓到，非插件 bug）。
+
+**收尾加固（全类型测试阶段发现）**：
+- `verify_all_types.lua` 处理 GBK 样本时经 `Converter.lines()` 会在源文件同目录生成 `.txt2epub_decode.tmp`，但验证脚本漏调 `release_lines()`，导致临时文件污染样本目录、有被误打包风险。现每个文件处理完（成功/失败路径）都用 `pcall(release_lines)` 清理；真机 `main.lua` 本就在 pcall 后无条件清理，插件逻辑无误。
+- `Converter._decode_tmp()` 原只判断解码临时文件「能否打开」，未判「是否为空」。设备无 `iconv` / 解码失败时 shell 重定向仍会创建空文件，被当作结果返回会导致**空书 + 空临时文件残留**。现改为判空即删除并返回 `false`，回退为按原始字节流式读（内存有界、不崩溃、不空书），与「无 iconv 时按原始字节处理」承诺一致。`test_edge.lua` 新增 3 项边界用例覆盖空/正常输出，双解释器通过。
+
 ## v2.1.0（2026-11-15）
 ### 修复：`.doc` 仍无目录、`.docx` 大文件崩溃；新增 Markdown / HTML 支持
 

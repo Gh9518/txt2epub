@@ -136,6 +136,30 @@ function TXT2EPUB:file_ext(file)
     return "." .. e
 end
 
+-- 输出文件名：按「源格式」加一个小标记，避免同名不同格式互相覆盖。
+-- 例如 big_novel.txt / big_novel.docx / big_novel.html 分别输出
+--   big_novel_txt.epub / big_novel_docx.epub / big_novel_html.epub
+-- 若 base 本身已经以该标记结尾（例如重复转换已带标记的源），则不重复追加。
+-- 这里做成纯函数（可由单元测试直接调用）。
+function TXT2EPUB.output_name_with_ext(base, ext)
+    base = base or "未命名"
+    local tag = nil
+    if ext and ext ~= "" then
+        tag = tostring(ext):gsub("^%.", ""):lower():gsub("[^%w]", "")
+    end
+    if not tag or tag == "" then return base .. ".epub" end
+    local suffix = "_" .. tag
+    -- 已带标记（大小写不敏感）则原样返回，防止 big_txt_txt.epub
+    if base:lower():match(suffix:lower() .. "$") then
+        return base .. ".epub"
+    end
+    return base .. suffix .. ".epub"
+end
+
+function TXT2EPUB:_output_name(base, ext)
+    return TXT2EPUB.output_name_with_ext(base, ext)
+end
+
 -- 当前已打开文档的路径（容错：ui/document 未就绪时返回 nil）
 function TXT2EPUB:_current_file()
     local ok, doc = pcall(function() return self.ui and self.ui.document end)
@@ -1048,7 +1072,8 @@ function TXT2EPUB:_convert_document(doc, file)
     base = (base:gsub('[\\/:*?"<>|]', "_")):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     local lfs = require("libs/libkoreader-lfs")
     local out_dir = (file and util.dirname(file)) or (lfs.currentdir() or "/")
-    local out_path = util.joinPath(out_dir, base .. ".epub")
+    -- 按源格式加标记，避免 .doc/.docx/.rtf/.epub 等同名文件互相覆盖
+    local out_path = util.joinPath(out_dir, self:_output_name(base, file and self:file_ext(file) or nil))
 
     self:_set_log(file or out_path)
     self:_maintain_log(file or out_path)
@@ -1190,7 +1215,8 @@ function TXT2EPUB:convert(file)
         -- 去掉最后一个扩展名即可（.txt/.docx/.html/.htm/.md/.markdown 通用）
         local base = name:gsub("%.[^%.]+$", "")
         if base == "" then base = "未命名" end
-        local out_path = util.joinPath(util.dirname(file), base .. ".epub")
+        -- 按格式加标记：big_novel.txt/.docx/.html/.md 各自输出独立文件，不再覆盖
+        local out_path = util.joinPath(util.dirname(file), self:_output_name(base, ext))
 
         -- 输出已存在 -> 询问是否覆盖
         if file_exists(out_path) then
@@ -1281,6 +1307,11 @@ function TXT2EPUB:_async_run(work_fn, on_fail, on_done)
             self:_log("【协程异常】转换过程中出错（已捕获，未崩溃）：\n"
                 .. tostring(msg) .. "\n" .. tostring(tb or ""))
             if on_fail then on_fail(msg) end
+            -- 连续转换多个大文件时，失败路径同样是内存累积源：立即归还系统
+            co = nil
+            msg = nil
+            collectgarbage("collect")
+            collectgarbage("collect")
             return
         end
         if coroutine.status(co) ~= "dead" then
@@ -1289,6 +1320,15 @@ function TXT2EPUB:_async_run(work_fn, on_fail, on_done)
         else
             -- 协程正常结束：msg 即 work_fn 的返回值（转换结果表），交回 on_done 做收尾
             if on_done then on_done(msg) end
+            -- 连续转换崩溃（crash.log 只有 Killed、无 Lua 堆栈 = 内核 OOM）：
+            -- 每完成一次大文件转换就彻底回收，避免 8 次转换后内存累积到 OOM。
+            -- 两次 collect 让带 __gc 的对象（ZIP/文档句柄）在 LuaJIT 下确实释放；
+            -- 并断开协程与结果表引用，防止闭包把它们一直挂在 UIManager 队列里。
+            msg = nil
+            co = nil
+            work_fn = nil
+            collectgarbage("collect")
+            collectgarbage("collect")
         end
     end
     UIManager:nextTick(step)
@@ -1508,6 +1548,14 @@ function TXT2EPUB:_do_convert_docx(file, out_path, base)
             -- 用显式标志位避开各 Lua 版本 coroutine.running() 语义差异。
             on_yield = function()
                 if self._in_async then coroutine.yield() end
+            end,
+            -- 标题来源体检：Word 样式标题为 0 时会从正文文本兜底恢复章节。
+            -- 真机排查「目录不全 / 崩溃」时看这一行即可确认是否生效。
+            on_diag = function(rst)
+                self:_log(string.format(
+                    "Word 标题体检：样式标题 %d，正文段 %d，文本候选标题 %d，兜底重切 %s（提升 %d，模式 %s）",
+                    rst.word_headings or 0, rst.body_paras or 0, rst.text_titles or 0,
+                    rst.enabled and "是" or "否", rst.promoted or 0, rst.mode or "-"))
             end,
             on_progress = function(i)
                 self._progress_i = i

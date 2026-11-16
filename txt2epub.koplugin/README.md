@@ -1,6 +1,6 @@
 # txt2epub —— KOReader 插件：TXT / Word / Markdown / HTML 一键转 EPUB
 
-在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成**同名的 `.epub`**，保存在原文件同一目录。插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 直接解析 OOXML；`.html` / `.htm` / `.md` 由 `markup.lua` 直接解析源文件；`.doc` / RTF / FB2 / EPUB 等由 KOReader 已打开的文档内容兜底。生成的 EPUB 带有可跳转的**多级章节目录**（EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`）与内置排版精修。
+在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成一个**带格式标记的 `.epub`**（如 `big_novel_txt.epub` / `big_novel_docx.epub`，保存在原文件同一目录；**v2.1.2 起按源格式加标记，同名不同格式不再互相覆盖**）。插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 直接解析 OOXML；`.html` / `.htm` / `.md` 由 `markup.lua` 直接解析源文件；`.doc` / RTF / FB2 / EPUB 等由 KOReader 已打开的文档内容兜底。生成的 EPUB 带有可跳转的**多级章节目录**（EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`）与内置排版精修。
 
 > 借鉴的开源项目与具体代码，见文末「致谢与开源借鉴」。命名建议见「七、更名方案」。
 
@@ -13,11 +13,15 @@
 ### Highlights
 - **One-tap, many formats** — `.txt`, `.docx`, `.html`, `.htm`, `.md` are parsed by the plugin itself (no dependency on KOReader's parser); other reader-supported formats use KOReader's parsed document as a fallback, with an empty-result guard instead of silently producing an empty book.
 - **TOC rebuilt from body (v2.0.1+)** — when KOReader returns **no TOC** for `.doc`/RTF/FB2 (Word heading styles become plain `<p>`), the plugin detects chapter headings in the extracted body and rebuilds a nested TOC + styled `<h1>` headings. **v2.1.0** also handles U+3000 full-width spaces (`第1章　标题`) and Chinese punctuation, and falls back to a plain-text rebuild when the DOM has no block tags at all.
-- **Fast, low-memory build (v2.1.0)** — CRC-32 now uses the LuaJIT `bit` library (table-based fallback elsewhere); a 2.8 MB `.docx` converts in ~0.4 s instead of minutes, and ZIP/EPUB buffers are released eagerly. This fixes the `Killed` (OOM) crash on Kindle.
+- **Fast, low-memory build (v2.1.0)** — CRC-32 now uses the LuaJIT `bit` library (table-based fallback elsewhere); a 2.8 MB `.docx` converts in ~0.4 s instead of minutes, and ZIP/EPUB buffers are released eagerly.
+- **Robust `.docx` TOC (v2.1.1)** — if a `.docx` loses its Word heading styles (`w:pStyle`), the plugin recovers chapter headings from the body text (short lines matching `第X章 / 第X节 …`), so a 2.2 MB book still gets its full multi-level TOC instead of 9 flat slices. Chapters are streamed to disk in ≤256 KB pieces without ever building one giant XHTML string, and **every piece is listed in the TOC**. This fixes both the `Killed` (OOM) crash and the "共 9 章 / no TOC" issue on Kindle; `.txt2epub.log` gains a "Word 标题体检" line to confirm.
 - **Multi-level TOC** — auto-detects 卷/部/册/篇 → 章/回 → 节/集/幕 instead of a flat list.
 - **Typography presets** (Compact / Standard / Relaxed / Custom) baked into `style.css` at conversion time — no resident hooks, zero runtime memory cost.
 - **Local font selection** — pick any installed font (name shown in your UI language) or type a name.
-- **Large-chapter splitting** — splits XHTML chapters larger than 256 KB; every split part gets its own TOC entry.
+- **Large-chapter splitting** — splits XHTML chapters larger than 256 KB, with the `<p>` wrapper overhead counted so actual output stays strictly under the limit; every split part gets its own TOC entry.
+- **Format-tagged output names (v2.1.2)** — same base name in different formats gets a small tag (`_txt` / `_docx` / `_html` / `_md` / `_doc`), so converting `big_novel.txt`, `big_novel.docx`, `big_novel.html`, `big_novel.md` no longer overwrites one `big_novel.epub`.
+- **Folded TXT TOC (v2.1.2)** — the 卷/章/节 level detected for TXT headings is preserved in `nav.xhtml` / `toc.ncx` (no longer flattened to one level). Conversion cleanup now does full GC on every completion to avoid OOM after a long run of large files.
+- **No-title body integrity (v2.1.3)** — fixed silent data loss: a TXT with no headings and no trailing blank line produced an empty chapter with all body text dropped. A final flush now preserves the text, covered by a Chinese-character-conservation regression test.
 
 ### Install
 1. Unzip the release archive — it contains a single top-level folder `txt2epub.koplugin/`.
@@ -52,7 +56,7 @@
 | 扩展名 | 转换方式 | 目录来源 |
 | --- | --- | --- |
 | `.txt` | 插件自解析（流式按行） | 章节标题正则 / 空格缩进 |
-| `.docx` | 插件自解析 OOXML | Word 标题样式（Heading1/2/3… 与 Title） |
+| `.docx` | 插件自解析 OOXML | Word 标题样式（Heading1/2/3… 与 Title）；**v2.1.1：样式为 0 时自动从正文文本恢复章节标题** |
 | `.md` / `.markdown` | 插件自解析 `markup.lua` | `#` ~ `######`、Setext 标题 |
 | `.html` / `.htm` | 插件自解析 `markup.lua` | `<title>` 作书名、`<h1>`~`<h6>` 作多级标题 |
 | `.doc` / RTF / FB2 / EPUB | KOReader 已打开文档的 DOM 兜底 | 优先用 `getToc()`；为 0 时从正文识别标题重切分 |
@@ -72,9 +76,12 @@
 - **多级目录**：卷/部/册/篇 → 章/回 → 节/集/幕 三级嵌套，生成真正的 EPUB3 `nav.xhtml` 与 EPUB2 `toc.ncx`。
 - **排版预设**：紧凑（行距130%）/ 标准（默认，行距155%＋段距0.3em＋首行缩进2字）/ 宽松大字（行距185%＋字号115%）/ 自定义，转换时烘焙进 `style.css`，不装常驻钩子。
 - **本地字体**：列出本机全部已安装字体，菜单按界面语言显示中文名/英文名及样式（粗体·斜体）。
-- **Word 文档**：`.docx` 由纯 Lua 直接解析 OOXML，STORED 与 DEFLATE 均支持，不依赖设备 zlib；标题样式 → 多级目录 + 完整正文。旧版 `.doc` 走 DOM 兜底，即使 `getToc()` 返回 0 条也会从正文识别标题重切分。
+- **Word 文档**：`.docx` 由纯 Lua 直接解析 OOXML，STORED 与 DEFLATE 均支持，不依赖设备 zlib；标题样式 → 多级目录 + 完整正文。**v2.1.1 起**：若设备上的 `.docx` 丢失了 Word 标题样式（例如经 KOReader/WPS 打开另存后），插件会从正文短段落自动恢复「第X章 / 第X节」等章节标题，仍生成完整多级目录，不再退化成几个硬切片；超大章节按 ≤256 KB 分片流式写出、全部分片进目录，避免低内存设备 OOM。旧版 `.doc` 走 DOM 兜底，即使 `getToc()` 返回 0 条也会从正文识别标题重切分。
 - **Markdown / HTML**：`.md` / `.html` / `.htm` 由插件直接读磁盘解析，不依赖 KOReader 是否支持该格式；支持 ATX/Setext 标题、`<h1>`~`<h6>`、代码块、列表、引用、行内标记与 XML 实体，UTF-8 与 GBK 编码均可。
-- **超大章节切分**：单章 XHTML 超过 256 KB 自动切分；**每个分片都有目录条目**，不会再出现「整本书只有 1 条目录」。
+- **超大章节切分**：单章 XHTML 超过 256 KB 自动切分；**v2.1.2 起按「段落实际输出字节（含 `<p>` 包装开销）」估算**，单章严格 <256 KB（旧版按原始文本字节切，曾被包装撑到 273 KB）。TXT / DOCX / Markdown / HTML / DOM 兜底各格式均已用超长章样本验证；**每个分片都有目录条目**，不会再出现「整本书只有 1 条目录」。
+- **输出文件名（v2.1.2）**：按源格式加小标记，例如 `big_novel.txt → big_novel_txt.epub`、`big_novel.docx → big_novel_docx.epub`、`big_novel.html → big_novel_html.epub`、`big_novel.md → big_novel_md.epub`。同名不同格式各自独立，不再互相覆盖（覆盖还会产生半成品 EPUB，触发 `CRE zip corrupted` 警告）。已带标记的文件名不会重复追加。
+- **TXT 目录折叠（v2.1.2）**：修复 TXT 标题模式把卷/章/节层级压平成 0 级的问题，多级目录在 `nav.xhtml` / `toc.ncx` 中正确嵌套折叠。
+- **无标题正文完整性（v2.1.3）**：修复 TXT 全文无标题、末尾无空行时正文被静默丢弃（只产出空章）的缺陷；循环结束补收尾 flush，正文按 256 KB 分片完整保留，并有「中文字符守恒」回归测试兜底。
 - **低内存**：CRC-32 走 LuaJIT `bit`（其余环境查表回退），ZIP 写完即释放，逐段消费段落序列；Kindle 等低内存设备上不再因分钟级纯 Lua 运算被系统 `Killed`。
 - **墨水屏友好**：`word-break`、`orphans/widows: 2`、`page-break-after: avoid` 等。
 - **稳健识别（借鉴 moon）**：中文数字校验 + 特例标题 + 误判过滤 + 段落回流合并。
@@ -114,8 +121,13 @@
 详细的崩溃修复与版本变更见 **[CHANGELOG.md](CHANGELOG.md)**。常见问题速查：
 
 - **菜单不显示**（甚至其它插件也消失）：确认目录名为 `txt2epub.koplugin` 且位于 `plugins/`。若所有插件菜单都消失，通常是某插件的 `addToMainMenu` 抛错导致 `MenuSorter` 合并失败——本插件用标准 `sorting_hint = "tools"` 写法，不会触碰内置菜单结构。
-- **无目录 / 只有 1 条目录**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
-- **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。
+- **转换后是空书 / 只有标题没有正文（v2.1.3 已修复）**：旧版对「全文无标题 + 末尾无空行」的 TXT（例如整本一行的纯正文）会丢掉全部正文，只生成 1 个空章。v2.1.3 起正文完整保留并自动分片。若仍遇到空书，请提供 `.txt2epub.log` 与源文件结构（行数 / 是否含标题）。
+- **不同格式同名文件互相覆盖 / 提示已有同名 EPUB（v2.1.2 已解决）**：输出名现在带格式标记（`_txt`/`_docx`/`_html`/`_md`/`_doc`），如 `big_novel_txt.epub` 与 `big_novel_docx.epub` 并存。若仍看到旧的无标记 `big_novel.epub`，那是 v2.1.1 及更早版本生成的遗留文件，可删除。
+- **TXT 目录不折叠 / 全平铺（v2.1.2 已修复）**：旧版 TXT 标题模式把卷/章/节层级压成 0 级，目录一长串不折叠。v2.1.2 保留已识别的层级，目录按卷→章→节嵌套；若你的 TXT 没有「第一卷/第X章/第X节」这类标题，可在「章节标题正则」补充后再转换。
+- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒），建议单次转换后重启 KOReader 释放 DOM 缓存，并提供 `.txt2epub.log` + `crash.log`。
+- **`.docx` 目录不全 / 只有几章（v2.1.1 重点修复）**：看 `.txt2epub.log` 新增的「**Word 标题体检**」行。若「样式标题 0、兜底重切 是」，说明设备上的 `.docx` 丢了 Word 标题样式，插件已自动从正文文本恢复章节标题（`第X章 / 第X节` 等短段落），目录应完整；若「文本候选标题」仍为 0，说明正文写法不在默认识别范围内，可在「设置章节标题正则」补充 Lua 模式。v2.1.1 起每个 256 KB 分片都会列入目录，即使完全无标题也不会只剩 1 条。
+- **无目录 / 只有 1 条目录（`.doc` 等 DOM 格式）**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
+- **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；**v2.1.1 更进一步**：超大章节按段流式写盘、不再拼整章大字符串，且 Word 样式丢失时先恢复标题以免生成 2.2 MB 巨型单章，消除大 `.docx` 的 OOM `Killed`。若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。
 - **排查日志**：优先发**源文件同目录的隐藏文件 `.txt2epub.log`**（含时间戳、源类型、逐章进度、体检字段、完整 Lua 错误栈）；`crash.log` / `koreader.log`（KOReader 安装目录下）用于区分插件问题与原生固件/内存问题。
 
 ---
@@ -130,7 +142,7 @@
 | GitHub 仓库 | `Gh9518/txt2epub` | `Gh9518/doc2epub`（用 GitHub rename，旧链接自动重定向） |
 | 菜单显示名 | `TXT2EPUB` | `Doc2EPUB`（中文界面可写「文档转 EPUB」） |
 | `_meta.lua` | `fullname = "TXT2EPUB"` | `fullname = "Doc2EPUB — 文档转 EPUB"` |
-| Release / 附件 | `v2.1.0` + `txt2epub.koplugin.zip` | `v3.0.0` + `doc2epub.koplugin.zip` |
+| Release / 附件 | `v2.1.1` + `txt2epub.koplugin.zip` | `v3.0.0` + `doc2epub.koplugin.zip` |
 | 一句话简介 | 「TXT 排版助手」 | 「把 TXT/Word/Markdown/HTML 等文档转成带多级目录的 EPUB」 |
 
 **备选名**：`any2epub.koplugin`（强调多格式）、`text2epub.koplugin`（比 txt 宽但仍偏文本）、`epubforge.koplugin`（品牌感强、可注册性好，但不直观）。
