@@ -1216,6 +1216,77 @@ function Converter.build_chapter_xhtml(title, paras, indent, level)
     return table.concat(blocks, "\n")
 end
 
+------------------------------------------------------------------------
+-- 书名页（封面页）：真机反馈「所有转换文件都没有书名页 / 标题未单独成目录」。
+-- 生成一页居中显示书名的 XHTML，并作为目录(nav/ncx)与 spine 的首项。
+-- 通过 opts.title_page 开启（main.lua 真机转换时置 true；测试默认关闭，
+-- 以维持既有「章节数 == 目录数」断言不变）。
+------------------------------------------------------------------------
+Converter.TITLE_PAGE_FILE = "OEBPS/title_page.xhtml"
+
+function Converter.build_title_page(book_title)
+    book_title = book_title or "未命名"
+    local blocks = {
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE html>',
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="zh" xml:lang="zh">',
+        '<head>',
+        '<meta charset="UTF-8"/>',
+        '<title>' .. escape_xml(book_title) .. '</title>',
+        '<link rel="stylesheet" type="text/css" href="style.css"/>',
+        '</head>',
+        '<body>',
+        '<h1 class="book-title">' .. escape_xml(book_title) .. '</h1>',
+        '</body>',
+        '</html>',
+    }
+    return table.concat(blocks, "\n")
+end
+
+-- 书名页专用 CSS（居中、大字号、分页），仅当开启书名页时追加。
+function Converter.build_title_page_css()
+    return [[
+/* 书名页 */
+.book-title {
+  text-align: center;
+  font-weight: bold;
+  font-size: 1.8em;
+  text-indent: 0;
+  margin: 3em 0;
+  page-break-after: always;
+}
+]]
+end
+
+-- 把书名页节点插入轻量 toc 列表开头（供 nav/ncx/opf 共用），返回新表。
+function Converter.prepend_title_page(toc_list, book_title)
+    local out = { { file = Converter.TITLE_PAGE_FILE, title = book_title or "未命名",
+                    level = -1, toc = true, children = {} } }
+    for i, e in ipairs(toc_list or {}) do out[#out + 1] = e end
+    return out
+end
+
+-- 统一的收尾写入：style.css / nav.xhtml / toc.ncx / content.opf。
+-- 当 opts.title_page 为真时，追加书名页 CSS 并把书名页作为目录与 spine 首项。
+-- book_title: 书名；nested: 已 nest 的目录树；opf_list: 扁平章节列表；
+-- uid/modified: OPF 元数据。
+function Converter.write_epub_tail(zip, opts, book_title, nested, opf_list, uid, modified)
+    local indent = opts.indent or "2em"
+    local tp = opts.title_page == true
+    local css = Converter.build_style_css({ indent = indent, style = opts.style })
+    if tp then css = css .. Converter.build_title_page_css() end
+    zip:add("OEBPS/style.css", css)
+    local nav_nodes, opf_toc = nested, opf_list
+    if tp then
+        nav_nodes = Converter.prepend_title_page(nested, book_title)
+        opf_toc = Converter.prepend_title_page(opf_list, book_title)
+        zip:add(Converter.TITLE_PAGE_FILE, Converter.build_title_page(book_title))
+    end
+    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nav_nodes, book_title))
+    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nav_nodes, book_title, uid))
+    zip:add("OEBPS/content.opf", Converter.build_opf(opf_toc, book_title, uid, modified))
+end
+
 -- 样式表（排版优化：借鉴 txtstyle.koplugin 的参数模型，在【转换时】一次性烘焙进
 --   EPUB 静态 CSS；不安装任何阅读期钩子，因此【不会】增加 KOReader 常驻内存 / CPU）。
 --   opts: { indent = "2em", style = 预设名 | 参数表 }
@@ -1551,10 +1622,7 @@ function Converter.build_epub(chapters, out_path, opts, hooks)
     local nested = Converter.nest_toc(flat)
 
     -- 4) 其余构件
-    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
-    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
-    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
-    zip:add("OEBPS/content.opf", Converter.build_opf(flat, book_title, uid, modified))
+    Converter.write_epub_tail(zip, opts, book_title, nested, flat, uid, modified)
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     return true, #flat
@@ -1775,10 +1843,7 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
         if e.toc ~= false then toc_for_nav[#toc_for_nav + 1] = e end
     end
     local nested = Converter.nest_toc(toc_for_nav)
-    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
-    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
-    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
-    zip:add("OEBPS/content.opf", Converter.build_opf(toc, book_title, uid, modified))
+    Converter.write_epub_tail(zip, opts, book_title, nested, toc, uid, modified)
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     collectgarbage("collect")  -- 构建结束整体回收，及时把内存还给系统
@@ -2008,10 +2073,7 @@ function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, 
         if e.toc ~= false then toc_for_nav[#toc_for_nav + 1] = e end
     end
     local nested = Converter.nest_toc(toc_for_nav)
-    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
-    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
-    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
-    zip:add("OEBPS/content.opf", Converter.build_opf(toc, book_title, uid, modified))
+    Converter.write_epub_tail(zip, opts, book_title, nested, toc, uid, modified)
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     collectgarbage("collect")
@@ -2587,10 +2649,7 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
         if e.toc ~= false then toc_for_nav[#toc_for_nav + 1] = e end
     end
     local nested = Converter.nest_toc(toc_for_nav)
-    zip:add("OEBPS/style.css", Converter.build_style_css({ indent = indent, style = opts.style }))
-    zip:add("OEBPS/nav.xhtml", Converter.build_nav(nested, book_title))
-    zip:add("OEBPS/toc.ncx", Converter.build_ncx(nested, book_title, uid))
-    zip:add("OEBPS/content.opf", Converter.build_opf(toc_meta, book_title, uid, modified))
+    Converter.write_epub_tail(zip, opts, book_title, nested, toc_meta, uid, modified)
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     collectgarbage("collect")

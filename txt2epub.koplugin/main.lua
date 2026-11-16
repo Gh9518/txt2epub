@@ -1123,6 +1123,7 @@ function TXT2EPUB:_do_convert_document(doc_api, out_path, base)
         book_title = base,
         uid = "urn:uuid:" .. Converter.gen_uid(),
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
     self:_log("开始由已打开文档生成 EPUB：" .. out_path)
     local build_ok, count, stats
@@ -1414,6 +1415,7 @@ function TXT2EPUB:_do_convert(file, out_path, base, single, total)
         book_title = base,
         uid = "urn:uuid:" .. Converter.gen_uid(),
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
     local kind = single and "single" or "title"
     local arg = single and nil or (self:get_pattern() or nil)  -- 标题模式传 patterns（nil=用默认）
@@ -1468,6 +1470,7 @@ function TXT2EPUB:_do_convert_indent(file, out_path, base, total)
         book_title = base,
         uid = "urn:uuid:" .. Converter.gen_uid(),
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
     local step = self:get_indent_step()
     self:_log("开始流式生成 EPUB（缩进模式）：" .. out_path)
@@ -1539,6 +1542,7 @@ function TXT2EPUB:_do_convert_docx(file, out_path, base)
         book_title = base,
         uid = "urn:uuid:" .. Converter.gen_uid(),
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
     self:_log("开始由 Word 生成 EPUB：" .. out_path)
     local build_ok, count
@@ -1612,6 +1616,7 @@ function TXT2EPUB:_do_convert_markup(file, out_path, base)
         book_title = base,
         uid = "urn:uuid:" .. Converter.gen_uid(),
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
     self:_log("开始由标记文档生成 EPUB：" .. out_path)
     local build_ok, count
