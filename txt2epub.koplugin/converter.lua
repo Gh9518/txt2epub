@@ -2526,6 +2526,32 @@ function Converter.build_epub_from_document(doc_api, out_path, opts, hooks)
             end
         end
     end
+    -- TOC 层级修复（真机 fb2 目录不折叠）：部分格式（如 FB2/部分 RTF）的
+    -- getToc() 返回的所有 depth 都是 1（平级），但标题文本本身是「第一卷 /
+    -- 第一章 / 第一节」多级写法。当检测到 depth 无层级信息（取值种类 ≤1）
+    -- 且标题能被 title_level 识别出至少两种不同的层级时，改用文本层级，
+    -- 让目录正确嵌套折叠。
+    if #chapters >= 2 then
+        local levels, lvset, lvcount = {}, {}, 0
+        for _, ch in ipairs(chapters) do
+            local d = ch.level or 1
+            levels[#levels + 1] = d
+            if not lvset[d] then lvset[d] = true; lvcount = lvcount + 1 end
+        end
+        if lvcount <= 1 then
+            local tset, tcount = {}, 0
+            for _, ch in ipairs(chapters) do
+                local tl = Converter.title_level(ch.title or "")
+                ch._text_level = tl
+                if not tset[tl] then tset[tl] = true; tcount = tcount + 1 end
+            end
+            if tcount >= 2 then
+                for _, ch in ipairs(chapters) do ch.level = ch._text_level end
+            end
+            for _, ch in ipairs(chapters) do ch._text_level = nil end
+        end
+    end
+
     -- 无 TOC：按页聚合为单章（PDF 等非 CreDocument 即便有页也无法取 HTML，此处仅作回退）
     if #chapters == 0 and get_html and doc_api.page_count and doc_api.page_count > 0
         and type(doc_api.get_page_xp) == "function" then
