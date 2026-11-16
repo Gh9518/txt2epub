@@ -2,6 +2,32 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.4（2026-11-17，真机第二轮反馈）
+
+依据用户上传的 `crash.log` 与各目录 `.txt2epub.log`，修复以下真机问题；全部经 Lua 5.3 / LuaJIT 双解释器回归（新增 `test/test_fixes_v214.lua` 9 项全通过）。
+
+### 1. GBK 文本在无 iconv 设备上丢目录与正文（`05_edges/edge_gbk.txt`）
+- 现象：真机 `has_title 预检结果：false` → 缩进模式回退整本单章，中文标题与正文全部丢失。
+- 根因：旧版 GBK 解码依赖系统 `iconv` 命令；Kindle 等真机无 `iconv`，`_decode_tmp` 产出空文件后回退「原始 GBK 字节流」，标题正则无法匹配、正文为乱码。
+- 修复：新增纯 Lua 模块 `gbk.lua`（GB2312→UTF-8 紧凑码表约 16 KB、流式内存有界、零外部依赖）。`converter.lua` 在 iconv 失败时回退 `gbk.decode_stream`：TXT 走 `_decode_tmp`、MD/HTML 走 `decode_via_iconv`。沙箱模拟无 iconv（PATH 置空）后 `edge_gbk.txt` 的「第一卷 / 第一章」等标题均正确识别，Lua 5.3 / LuaJIT 输出一致。
+
+### 2. 内联标签 HTML 无目录（`05_edges/edge_html_inline.html`）
+- 现象：标题只写在 `<span>` 内、无 `<hN>`/`<p>` 块级标签，转换只有 1 章、无目录。
+- 修复：`build_epub_from_markup` 在解析结果完全没有 heading 时，复用 docx 的正文标题恢复逻辑，把「短段 + 命中章节标题规则」的段落提升为 heading。该样本现有 3 章目录，与其他格式标题识别一致。
+
+### 3. TXT 缩进模式超长单行变成超长空目录（`05_edges/edge_no_title.txt`）
+- 现象：真机走「按缩进切分」时，744 KB 单行纯正文被当成一个目录节点标题、正文传空表，产出单个超长空目录、正文全丢。
+- 修复：indent 模式对超过 512 字节的行视为正文，按 UTF-8 边界拆段交给 emit 的 256 KB 分片逻辑，每片进目录。短行（正常缩进目录项）语义不变。该样本现有 4 个分片目录、正文完整。
+
+### 4. EPUB 重复转换导致目录嵌套重复（通性问题）
+- 现象：打开已转换的 `.epub` 再点转换，KOReader 已渲染的书名页/目录被当正文再包一层，点进正文出现两个目录标题。
+- 修复：`convert()` 对 `.epub` 先弹确认框「重复转换会把原目录/书名页当正文再包一层…如非必要请取消」，误点可取消，确需重新打包才继续。`test_routing.lua` / `test_picker.lua` 已适配并新增确认提示断言。
+
+### 5. DOCX / Markdown 大文件转换前防御性内存回收
+- 依据 `crash.log` 时间线：`Killed` 发生在 KOReader「opening file」阶段、早于插件转换日志，主因是 KOReader 原生打开/渲染 Word 的 DOM 占用。插件侧无法释放已渲染 DOM，但在 DOCX/Markup 自解析入口转换前做两轮全量 `collectgarbage("collect")`，并（DOCX）记录 `collectgarbage("count")` 堆占用到 `.txt2epub.log`，便于区分原生 DOM 与插件逻辑。真机建议：大 DOCX 若崩溃，重启 KOReader 后用「选择文件」直接选 docx，避免先打开文档产生 DOM。
+
+> 已知限制：`06_dom_fallback/dom_sample.rtf` 真机「目录不全」经 mock 验证重切分逻辑本身正确（5 章全识别），根因是 KOReader 对 RTF 的 DOM 渲染返回内容本身不全（可见正文仅 1038 字符且含乱码），属引擎能力限制，插件无法补回缺失的渲染内容；建议重要文档优先用 `.docx` 自解析路径。
+
 ## v2.1.3（2026-11-16）
 
 全量代码自测（静态校验 + 20 套件双解释器回归 + 62 文件双解释器端到端 + EPUB XML 良构性 + 正文完整性）中发现并修复一个**静默正文丢失**缺陷。

@@ -1195,6 +1195,26 @@ function TXT2EPUB:convert(file)
         return
     end
     if not SELF_PARSE_EXT[ext] then
+        -- EPUB 重复转换防护（真机反馈）：.epub 本身多为转换产物，若再次转换，
+        -- KOReader 已渲染的书名页/目录会被当成正文再包一层，点进正文出现「两个目录标题」。
+        -- 这里默认拦一道确认，误点可取消；确需重新打包才继续。
+        if ext == ".epub" then
+            UIManager:show(ConfirmBox:new{
+                text = _("检测到源文件是 .epub（通常已是转换结果）。\n重复转换会把原有目录/书名页当成正文再包一层，导致正文出现重复目录标题。\n如非必要请点「取消」；确需重新打包请点「继续转换」。"),
+                ok_text = _("继续转换"),
+                cancel_text = _("取消"),
+                ok_callback = function()
+                    if doc then
+                        self:_convert_document(doc, file)
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("请在 KOReader 中打开该 EPUB 后再转换。"),
+                        })
+                    end
+                end,
+            })
+            return
+        end
         -- 插件无专用解析器的格式：交给通用 DOM 流程（或提示在 KOReader 中打开）
         if doc then
             self:_convert_document(doc, file)
@@ -1544,6 +1564,16 @@ function TXT2EPUB:_do_convert_docx(file, out_path, base)
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
+    -- 大 DOCX 崩溃防御（真机 11-16 22:24 big_novel.docx / 11-17 04:18 long_chapter.docx）：
+    -- crash.log 显示 Killed 发生在 KOReader「opening file」阶段、早于插件转换日志，
+    -- 主因是 KOReader 原生打开/渲染 Word 的 DOM 内存占用。插件无法释放已渲染 DOM，
+    -- 但可在转换前把可回收的临时对象尽量归还，并记录 Lua 堆占用；若随后仍 Killed，
+    -- 即可由日志确认是原生 DOM 而非本插件逻辑（真机可改用「文件选择器直接选 docx」绕开）。
+    pcall(collectgarbage, "collect")
+    pcall(collectgarbage, "collect")
+    local heap_kb = tonumber(collectgarbage("count")) or 0
+    self:_log(string.format("Word 转换前 Lua 堆约 %d KB（转换在独立协程读磁盘源，不依赖已渲染 DOM）",
+        math.floor(heap_kb)))
     self:_log("开始由 Word 生成 EPUB：" .. out_path)
     local build_ok, count
     local status, perr = pcall(function()
@@ -1618,6 +1648,9 @@ function TXT2EPUB:_do_convert_markup(file, out_path, base)
         modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         title_page = true,  -- 书名页：标题单独成目录首项（真机反馈「无书名页」）
     }
+    -- 同 DOCX：超大 HTML/MD 也可能叠加已打开文档内存，转换前先做两轮全量回收
+    pcall(collectgarbage, "collect")
+    pcall(collectgarbage, "collect")
     self:_log("开始由标记文档生成 EPUB：" .. out_path)
     local build_ok, count
     local status, perr = pcall(function()

@@ -143,6 +143,10 @@ inst.ui.document.file = "/books/c.epub"
 Menu.shown = {}; captured = {}
 pick_called_epub = false; dom_called = false; selfparse_called = false
 local ok_e = pcall(function() inst:convert() end)
+-- EPUB 重复转换防护会先弹确认框：模拟用户点「继续转换」后再判定路由
+for _, w in ipairs(captured) do
+    if w._type == "ConfirmBox" and type(w.ok_callback) == "function" then w.ok_callback() end
+end
 check("打开 epub 时 convert() 不 panic", ok_e, tostring(ok_e))
 check("打开 epub -> 走通用 DOM 兜底", dom_called)
 check("打开 epub -> 不弹选择器（有文档对象即可转换）", not pick_called_epub)

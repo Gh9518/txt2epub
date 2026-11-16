@@ -104,7 +104,12 @@ local function route_of(file)
     inst._dispatch_convert = function(self, f, out, base, ext) route = "selfparse:" .. tostring(ext) end
     inst._convert_document = function(self, doc, f) route = "dom" end
     inst.pick_and_convert = function(self) route = "picker" end
+    captured = {}
     local ok = pcall(function() inst:convert() end)
+    -- EPUB 重复转换防护会先弹确认框：模拟用户点「继续转换」，验证确认后仍走 DOM 兜底
+    for _, w in ipairs(captured) do
+        if w._type == "ConfirmBox" and type(w.ok_callback) == "function" then w.ok_callback() end
+    end
     return route, ok, inst
 end
 
@@ -124,6 +129,14 @@ check(".rtf -> 通用 DOM 兜底", r == "dom", r)
 
 r, ok = route_of("/x/a.epub")
 check(".epub -> 通用 DOM 兜底", r == "dom", r)
+-- EPUB 重复转换防护：转换前应弹确认框（避免误点二次转换产生重复目录）
+local epub_confirm_seen = false
+for _, w in ipairs(captured) do
+    if w._type == "ConfirmBox" and w.text and tostring(w.text):find("epub", 1, true) then
+        epub_confirm_seen = true
+    end
+end
+check(".epub -> 转换前弹出重复转换确认提示", epub_confirm_seen)
 
 r, ok = route_of("/x/a.fb2")
 check(".fb2 -> 通用 DOM 兜底", r == "dom", r)

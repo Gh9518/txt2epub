@@ -22,6 +22,10 @@
 - **Format-tagged output names (v2.1.2)** — same base name in different formats gets a small tag (`_txt` / `_docx` / `_html` / `_md` / `_doc`), so converting `big_novel.txt`, `big_novel.docx`, `big_novel.html`, `big_novel.md` no longer overwrites one `big_novel.epub`.
 - **Folded TXT TOC (v2.1.2)** — the 卷/章/节 level detected for TXT headings is preserved in `nav.xhtml` / `toc.ncx` (no longer flattened to one level). Conversion cleanup now does full GC on every completion to avoid OOM after a long run of large files.
 - **No-title body integrity (v2.1.3)** — fixed silent data loss: a TXT with no headings and no trailing blank line produced an empty chapter with all body text dropped. A final flush now preserves the text, covered by a Chinese-character-conservation regression test.
+- **GBK without iconv (v2.1.4)** — a pure-Lua GB2312 decoder (`gbk.lua`) kicks in when the device has no `iconv`, so GBK text keeps its headings and body instead of becoming an empty/garbled book.
+- **Inline-tag HTML headings (v2.1.4)** — HTML whose headings live only inside `<span>` (no `<hN>`) now recovers a multi-level TOC from short chapter-like lines.
+- **Long single-line TXT (v2.1.4)** — indent mode splits an over-long heading-free line into byte-sized parts, each listed in the TOC, instead of one giant empty TOC entry.
+- **EPUB re-convert guard (v2.1.4)** — converting an already-converted `.epub` asks for confirmation first, avoiding a nested duplicate TOC on a mis-tap.
 
 ### Install
 1. Unzip the release archive — it contains a single top-level folder `txt2epub.koplugin/`.
@@ -124,7 +128,10 @@
 - **转换后是空书 / 只有标题没有正文（v2.1.3 已修复）**：旧版对「全文无标题 + 末尾无空行」的 TXT（例如整本一行的纯正文）会丢掉全部正文，只生成 1 个空章。v2.1.3 起正文完整保留并自动分片。若仍遇到空书，请提供 `.txt2epub.log` 与源文件结构（行数 / 是否含标题）。
 - **不同格式同名文件互相覆盖 / 提示已有同名 EPUB（v2.1.2 已解决）**：输出名现在带格式标记（`_txt`/`_docx`/`_html`/`_md`/`_doc`），如 `big_novel_txt.epub` 与 `big_novel_docx.epub` 并存。若仍看到旧的无标记 `big_novel.epub`，那是 v2.1.1 及更早版本生成的遗留文件，可删除。
 - **TXT 目录不折叠 / 全平铺（v2.1.2 已修复）**：旧版 TXT 标题模式把卷/章/节层级压成 0 级，目录一长串不折叠。v2.1.2 保留已识别的层级，目录按卷→章→节嵌套；若你的 TXT 没有「第一卷/第X章/第X节」这类标题，可在「章节标题正则」补充后再转换。
-- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒），建议单次转换后重启 KOReader 释放 DOM 缓存，并提供 `.txt2epub.log` + `crash.log`。
+- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒）。**v2.1.4 起**转换前还会主动全量回收并把堆占用写入 `.txt2epub.log`。大 DOCX 若崩溃，建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
+- **打开已转换的 .epub 再点转换，正文出现两个目录（v2.1.4 已处理）**：`.epub` 本身多为转换产物，重复转换会把原书名页/目录当正文再包一层。v2.1.4 起会对 `.epub` 先弹确认提示，误点选「取消」即可；确需重新打包再点「继续转换」。
+- **GBK 中文文本转换无目录 / 内容乱码（v2.1.4 已修复）**：设备无 `iconv` 时旧版会丢目录与正文。v2.1.4 内置纯 Lua GB2312 解码兜底，无需 `iconv` 即可正确识别中文标题与正文。
+- **标题只写在 `<span>` 里的 HTML 无目录（v2.1.4 已修复）**：这类无 `<hN>` 的内联标签 HTML 现在会从短标题行恢复多级目录。
 - **`.docx` 目录不全 / 只有几章（v2.1.1 重点修复）**：看 `.txt2epub.log` 新增的「**Word 标题体检**」行。若「样式标题 0、兜底重切 是」，说明设备上的 `.docx` 丢了 Word 标题样式，插件已自动从正文文本恢复章节标题（`第X章 / 第X节` 等短段落），目录应完整；若「文本候选标题」仍为 0，说明正文写法不在默认识别范围内，可在「设置章节标题正则」补充 Lua 模式。v2.1.1 起每个 256 KB 分片都会列入目录，即使完全无标题也不会只剩 1 条。
 - **无目录 / 只有 1 条目录（`.doc` 等 DOM 格式）**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
 - **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；**v2.1.1 更进一步**：超大章节按段流式写盘、不再拼整章大字符串，且 Word 样式丢失时先恢复标题以免生成 2.2 MB 巨型单章，消除大 `.docx` 的 OOM `Killed`。若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。

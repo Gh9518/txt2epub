@@ -229,6 +229,23 @@ local function detect_bom(head)
     return "unknown", 0
 end
 
+-- 纯 Lua GB2312 解码兜底（真机无 iconv 时用）：把 inpath 解码写入 outpath。
+-- gbk.lua 是紧凑码表（约 16KB 字符串常量），零外部依赖、流式内存有界。
+-- 返回 true / false；模块缺失或解码失败均安全返回 false，由调用方决定下一步。
+local function decode_gbk_lua(inpath, outpath)
+    local ok, gbk = pcall(require, "gbk")
+    if not ok or type(gbk) ~= "table" or type(gbk.decode_stream) ~= "function" then
+        return false
+    end
+    local dok, derr = pcall(gbk.decode_stream, inpath, outpath)
+    if not dok then return false end
+    local r = io.open(outpath, "rb")
+    if not r then return false end
+    local sz = r:seek("end")
+    r:close()
+    return not not (sz and sz > 0)
+end
+
 -- 通过系统 iconv 尝试把非 UTF-8 字节流转成 UTF-8（GBK / GB18030 / GB2312）
 local function decode_via_iconv(raw)
     local candidates = { "GBK", "GB18030", "GB2312" }
@@ -251,6 +268,18 @@ local function decode_via_iconv(raw)
             end
         end
     end
+    -- iconv 不可用（真机常见）时回退纯 Lua GB2312 解码：复用已写入的 tmpin
+    local tmpout2 = os.tmpname()
+    if decode_gbk_lua(tmpin, tmpout2) then
+        local o = io.open(tmpout2, "rb")
+        local data = o and o:read("*a") or nil
+        if o then o:close() end
+        os.remove(tmpout2)
+        os.remove(tmpin)
+        os.remove(tmpout)
+        if data and #data > 0 then return data end
+    end
+    pcall(os.remove, tmpout2)
     os.remove(tmpin)
     os.remove(tmpout)
     return nil
@@ -374,6 +403,13 @@ function Converter._decode_tmp(path, enc)
     -- 与 README「设备无 iconv 时按原始字节处理」的承诺一致。
     if not sz or sz == 0 then
         pcall(os.remove, out)
+        -- ★ 真机（Kindle 等）常无 iconv 命令：此时 iconv 路线产出空文件，
+        --   旧逻辑回退“原始 GBK 字节流”→ 标题识别失效 / 正文乱码 / 目录丢失
+        --   （edge_gbk.txt 真机反馈）。这里在 GBK 路径（enc==nil）改用纯 Lua
+        --   GB2312 解码兜底，零外部依赖、内存有界，保证目录与正文都不丢。
+        if enc == nil and decode_gbk_lua(path, out) then
+            return out
+        end
         return false
     end
     return out
@@ -1747,13 +1783,27 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
         local step = (type(arg) == "number" and arg) or 4
         if step < 1 then step = 1 end
         local found = false
+        -- 真机 edge_no_title.txt：整本是一行 744KB 纯正文，无缩进、无标题。
+        -- 旧实现把这一整行当作「目录节点标题」、正文传空表 {}，于是产出一个
+        -- 744KB 的超长目录名且正文全丢（用户反馈「相当于转换失败」）。
+        -- 修复：超过阈值的行视为正文而非目录项——把行文本按 UTF-8 边界拆成
+        -- 64KB 段作为 paras 交给 emit，由 emit 的 256KB 分片逻辑切成多片、
+        -- 每片进目录。短行（正常缩进目录项）仍保持原「每行一节点、正文为空」语义。
+        local LONG_LINE_BYTES = 512
         local line = line_iter()
         while line ~= nil do
             if not is_blank(line) then
                 found = true
+                local trimmed = trim(line)
                 local w = leading_width(line, step)
                 local level = math.floor(w / step)
-                emit(trim(line), {}, level)
+                if #trimmed > LONG_LINE_BYTES then
+                    -- 超长行 = 正文：拆成段回流后由 emit 分片入目录，标题用书名+序号
+                    local body_paras = split_utf8_text(trimmed, 64 * 1024)
+                    emit(book_title, body_paras, 0)
+                else
+                    emit(trimmed, {}, level)
+                end
             end
             line = line_iter()
         end
@@ -2143,6 +2193,21 @@ function Converter.build_epub_from_markup(path, out_path, opts, hooks)
     local paragraphs = parsed.paragraphs or {}
     text, raw, parsed = nil, nil, nil
     collectgarbage("step")
+    -- 内联标签 HTML（如 <div><span>第一章…</span><br/><span>正文…</span></div>）
+    -- 没有 <hN>，markup 解析后全是 body 段 → 无目录（edge_html_inline 真机反馈）。
+    -- 当解析结果完全没有 heading 时，复用 docx 的正文标题恢复：把「短段 +
+    -- 命中章节标题规则」的段落提升为 heading，与 .txt/.docx 标题识别一致。
+    local has_heading = false
+    for _, p in ipairs(paragraphs) do
+        if p and p.kind == "heading" then has_heading = true break end
+    end
+    if not has_heading then
+        local rst
+        paragraphs, rst = Converter.recover_docx_headings(paragraphs, opts)
+        if hooks and type(hooks.on_diag) == "function" then
+            pcall(hooks.on_diag, rst)
+        end
+    end
     return Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, opts, hooks)
 end
 
