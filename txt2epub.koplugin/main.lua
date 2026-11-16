@@ -833,6 +833,34 @@ function TXT2EPUB:_open_progress(total, stage)
     self:_set_progress(0, total, self._progress_stage)
 end
 
+-- 把底层异常转成面向用户的简明中文提示（技术细节只写诊断日志，不弹在屏幕上）。
+-- 典型：损坏的 docx / 非 ZIP 文件、图片资源错误、空文件、不支持的格式等。
+function TXT2EPUB:_friendly_error(err)
+    local s = tostring(err or "")
+    -- 只取第一行，去掉 "xxx.lua:1234:" 前缀与 stack traceback
+    local first = s:match("^([^\n]*)") or s
+    first = first:gsub("^.-%.lua:%d+:%s*", "")
+    first = first:gsub("%s*stack traceback.*$", "")
+    -- 按已知错误类型给出可操作提示
+    if s:find("EOCD", 1, true) or s:find("不是合法的 ZIP", 1, true)
+       or s:find("ZIP / .docx", 1, true) or s:find("损坏", 1, true) then
+        return _("此文件不是有效的 .docx（Word 文档已损坏或并非真正的 Word 文件），无法转换。\n请重新导出/另存为 .docx 后再试。")
+    end
+    if s:find("图片", 1, true) or s:find("image", 1, true) then
+        return _("文档中的图片无法读取，本次转换无法完成。\n请另存为纯文字 .docx 或 .txt 后重试。")
+    end
+    if s:find("空", 1, true) and (s:find("文件", 1, true) or s:find("内容", 1, true)) then
+        return _("文件内容为空，无需转换。")
+    end
+    if s:find("权限", 1, true) or s:find("permission", 1, true) then
+        return _("没有写入权限，无法保存 EPUB。请检查目录权限。")
+    end
+    if s:find("磁盘", 1, true) or s:find("空间", 1, true) or s:find("no space", 1, true) then
+        return _("存储空间不足，无法保存 EPUB。请释放空间后重试。")
+    end
+    return _("转换失败，无法完成本次转换。\n原因：") .. first
+end
+
 -- 安全执行：捕获任何 Lua 错误，写入诊断日志并提示，绝不向上 panic 崩溃进程。
 function TXT2EPUB:_safe(fn, ctx)
     local ok, err = pcall(fn)
@@ -840,7 +868,7 @@ function TXT2EPUB:_safe(fn, ctx)
         local _, tb = pcall(debug.traceback, "", 2)
         self:_log("【捕获异常】" .. (ctx or "操作") .. "：\n" .. tostring(err) .. "\n" .. tostring(tb or ""))
         self:_close_progress()  -- 失败时关闭可能残留的常驻进度框，避免挡住错误提示
-        UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+        UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         return false
     end
     return true
@@ -1103,7 +1131,7 @@ function TXT2EPUB:_run_document(doc_api, out_path, base)
         function(err)
             self._in_async = false
             self:_close_progress()
-            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         end,
         function(res)
             self:_close_progress()
@@ -1371,7 +1399,7 @@ function TXT2EPUB:_run(file, out_path, base, single)
         function(err)
             self._in_async = false
             self:_close_progress()
-            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         end,
         function(res)
             self:_close_progress()
@@ -1406,7 +1434,7 @@ function TXT2EPUB:_run_indent(file, out_path, base)
         function(err)
             self._in_async = false
             self:_close_progress()
-            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         end,
         function(res)
             self:_close_progress()
@@ -1541,7 +1569,7 @@ function TXT2EPUB:_run_docx(file, out_path, base)
         function(err)
             self._in_async = false
             self:_close_progress()
-            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         end,
         function(res)
             self:_close_progress()
@@ -1626,7 +1654,7 @@ function TXT2EPUB:_run_markup(file, out_path, base)
         function(err)
             self._in_async = false
             self:_close_progress()
-            UIManager:show(InfoMessage:new{ text = _("转换失败：\n") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
         end,
         function(res)
             self:_close_progress()

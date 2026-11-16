@@ -26,6 +26,9 @@
 - **Inline-tag HTML headings (v2.1.4)** — HTML whose headings live only inside `<span>` (no `<hN>`) now recovers a multi-level TOC from short chapter-like lines.
 - **Long single-line TXT (v2.1.4)** — indent mode splits an over-long heading-free line into byte-sized parts, each listed in the TOC, instead of one giant empty TOC entry.
 - **EPUB re-convert guard (v2.1.4)** — converting an already-converted `.epub` asks for confirmation first, avoiding a nested duplicate TOC on a mis-tap.
+- **Fast raw-DEFLATE via zlib (v2.1.5)** — compressed `.docx` is now inflated by libz through ffi (C speed, tiny memory peak), fixing the "converted then Killed" OOM on slow devices; falls back to an optimized pure-Lua decoder when ffi/zlib is unavailable.
+- **Smaller footprint (v2.1.5)** — the GB2312 table is base64-encoded and lazily decoded, shrinking `gbk.lua` from 62 KB to 27 KB and the plugin package accordingly.
+- **Cleaner TOC titles (v2.1.5)** — punctuation between a chapter marker and its title (`第1章：开端`, `第六卷 - 狂暴`) becomes a single space; brackets and full-width spaces are preserved.
 
 ### Install
 1. Unzip the release archive — it contains a single top-level folder `txt2epub.koplugin/`.
@@ -128,10 +131,12 @@
 - **转换后是空书 / 只有标题没有正文（v2.1.3 已修复）**：旧版对「全文无标题 + 末尾无空行」的 TXT（例如整本一行的纯正文）会丢掉全部正文，只生成 1 个空章。v2.1.3 起正文完整保留并自动分片。若仍遇到空书，请提供 `.txt2epub.log` 与源文件结构（行数 / 是否含标题）。
 - **不同格式同名文件互相覆盖 / 提示已有同名 EPUB（v2.1.2 已解决）**：输出名现在带格式标记（`_txt`/`_docx`/`_html`/`_md`/`_doc`），如 `big_novel_txt.epub` 与 `big_novel_docx.epub` 并存。若仍看到旧的无标记 `big_novel.epub`，那是 v2.1.1 及更早版本生成的遗留文件，可删除。
 - **TXT 目录不折叠 / 全平铺（v2.1.2 已修复）**：旧版 TXT 标题模式把卷/章/节层级压成 0 级，目录一长串不折叠。v2.1.2 保留已识别的层级，目录按卷→章→节嵌套；若你的 TXT 没有「第一卷/第X章/第X节」这类标题，可在「章节标题正则」补充后再转换。
-- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒）。**v2.1.4 起**转换前还会主动全量回收并把堆占用写入 `.txt2epub.log`。大 DOCX 若崩溃，建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
+- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒）。**v2.1.4 起**转换前还会主动全量回收并把堆占用写入 `.txt2epub.log`。**v2.1.5 关键修复**：压缩版 docx（需 DEFLATE 解压）转换后约 8 秒被 Killed，根因是纯 Lua 逐字节解压 2.8MB XML 在 Kindle 上 CPU/内存爆炸（STORED 版无需解压故正常）；新版 inflate 优先调用 libz 做 C 级 raw 解压，无 ffi 时用优化的批量纯 Lua 解码，压缩版与 STORED 版行为一致。若仍崩溃，建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
 - **打开已转换的 .epub 再点转换，正文出现两个目录（v2.1.4 已处理）**：`.epub` 本身多为转换产物，重复转换会把原书名页/目录当正文再包一层。v2.1.4 起会对 `.epub` 先弹确认提示，误点选「取消」即可；确需重新打包再点「继续转换」。
 - **GBK 中文文本转换无目录 / 内容乱码（v2.1.4 已修复）**：设备无 `iconv` 时旧版会丢目录与正文。v2.1.4 内置纯 Lua GB2312 解码兜底，无需 `iconv` 即可正确识别中文标题与正文。
 - **标题只写在 `<span>` 里的 HTML 无目录（v2.1.4 已修复）**：这类无 `<hN>` 的内联标签 HTML 现在会从短标题行恢复多级目录。
+- **损坏的 .docx 提示看不懂（v2.1.5 已改进）**：文件损坏或图片错误时不再弹出整段 Lua 栈轨迹，而是显示简明中文提示（如「此文件不是有效的 .docx，无法转换，请重新导出/另存后再试」）；详细技术信息仍记录在 `.txt2epub.log`。
+- **RTF / FB2 目录不全、正文有乱码（v2.1.5 已改进）**：KOReader 渲染 RTF 时可能把负 Unicode 字符显示为乱码、并产生双重 HTML 实体。插件现在会多次解码实体、清洗乱码后再识别章节，乱码不再阻断目录。**但 RTF 内容缺失源于 KOReader 渲染引擎（可能只返回部分正文），插件无法补回未返回的内容**——重要文档请先另存为 `.docx` 再转换。
 - **`.docx` 目录不全 / 只有几章（v2.1.1 重点修复）**：看 `.txt2epub.log` 新增的「**Word 标题体检**」行。若「样式标题 0、兜底重切 是」，说明设备上的 `.docx` 丢了 Word 标题样式，插件已自动从正文文本恢复章节标题（`第X章 / 第X节` 等短段落），目录应完整；若「文本候选标题」仍为 0，说明正文写法不在默认识别范围内，可在「设置章节标题正则」补充 Lua 模式。v2.1.1 起每个 256 KB 分片都会列入目录，即使完全无标题也不会只剩 1 条。
 - **无目录 / 只有 1 条目录（`.doc` 等 DOM 格式）**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
 - **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；**v2.1.1 更进一步**：超大章节按段流式写盘、不再拼整章大字符串，且 Word 样式丢失时先恢复标题以免生成 2.2 MB 巨型单章，消除大 `.docx` 的 OOM `Killed`。若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。

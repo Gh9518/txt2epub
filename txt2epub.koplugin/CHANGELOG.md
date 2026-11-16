@@ -2,6 +2,36 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.5（2026-11-17，真机第三轮反馈 + 体积优化）
+
+依据新一轮 `crash.log`（05:59/06:01/06:03 `big_novel.docx`、06:30 `long_chapter.docx` 转换后约 8~14 秒 `Killed`）与两张真机截图修复；新增 `test/test_fixes_v215.lua`（21 项双解释器全通过）。
+
+### 1. 压缩版 .docx 转换必崩（OOM / Killed）—— 本轮最关键
+- **定位**：真机日志显示压缩版（`big_novel.docx` 117KB、`long_chapter.docx` 22KB）在「开始由 Word 生成 EPUB」后中断，**无后续「Word 标题体检」日志** → 崩溃在 `DocxReader.read()` 内部；而对应的 `*_STORED.docx`（无压缩，2.7MB/1.4MB）转换成功。解压后 `document.xml` 仅 2.8MB/1.4MB，排除数据量问题。
+- **根因**：旧版纯 Lua inflate 逐字节 `string.char` + table 写入处理 2.8MB XML，在 Kindle 慢速 CPU（且转换前 Lua 堆已 26~30MB）上 CPU/内存爆炸，被内核 OOM killer（Killed）强杀。
+- **修复**：`inflate.lua` 重构为双路径。① **快路径**：环境有 ffi + libz 时调用 `inflateInit2_(windowBits=-15)` 做 C 级 raw inflate（实测 2.8MB / 0.19s、内存峰值极小）；所有 ffi 声明分块 `pcall`， KOReader 已声明同名符号也不会整体回退，zlibVersion 失败回退通用版本串。② **回退路径**：无 ffi 时用优化的纯 Lua（分块冻结 + 32KB 窗口 + `string.rep` 批量 LZ77 复制，实测 2.8MB / 0.32s，比旧版快约 2 倍）。两条路径均用真实 docx 验证与系统 unzip **逐字节一致**，`test_inflate` 30 项全通过。
+
+### 2. 插件包体积 116.9KB → 显著下降（用户反馈 80KB→116.9KB 增幅过大）
+- 主因：`gbk.lua` 码表用 `\ddd` 十进制转义存 8178×2 字节，单文件达 62KB。
+- 修复：码表改用 base64 存储、首次使用时惰性解码，`gbk.lua` 由 62KB 降至 **27KB**；全 8178 码位与原版解码逐字节一致，Lua 5.3 / LuaJIT 均通过。
+
+### 3. 目录标题标点清理（`03_small_titles/title_punct.txt`）
+- 用户诉求：去除「第几章/卷」与标题内容间的标点，仅留空格（`第三章、缘起`→`第三章 缘起`、`第六卷 - 狂暴`→`第六卷 狂暴`），括号及内容保留。
+- 修复：`clean_title_text` 新增 `tidy_chapter_punct`，对中文（第X章/卷/节/回… + 冒号/顿号/连字符/间隔号等）与英文（Chapter/Part/Volume + 序号 + 冒号）统一替换为单空格；**成对括号与全角空格保留**（遵守目录保留原文承诺）。端到端验证 5 个标题：旧 `第1章：开端/第3章 - 远行/第5章、归途` → 新 `第1章 开端/第3章 远行/第5章 归途`，括号与全角空格标题不变。
+
+### 4. 损坏/图片错误 docx 的提示（`05_edges/edge_broken.docx`）
+- 现象：真机弹窗显示完整 Lua 栈轨迹（`main.lua:1604: ... converter.lua:2147: 不是合法的 ZIP/.docx（找不到 EOCD）`），用户看不懂。
+- 修复：新增 `_friendly_error`，识别 ZIP 损坏/图片错误/空文件/权限/空间等类型，弹简明中文提示（如「此文件不是有效的 .docx，无法转换，请重新导出/另存后再试」）；技术细节仍写 `.txt2epub.log`。所有 6 处错误弹窗统一改用。
+
+### 5. RTF/FB2 DOM 兜底乱码与内容（`06_dom_fallback/dom_sample.rtf`）
+- 现象：真机截图第二章标题后出现阿拉伯乱码，正文含未解码的 `&amp;` `&lt;`；日志显示仅识别 2 章（设计 5 章）。
+- 定位：RTF 标题本身是正常 Unicode 码点（应能识别）；乱码来自正文的负 `\u` 码点被 KOReader 误渲染。真机 `get_html` 仅返回 1038 可见字符（内容本身不全）——此部分属 KOReader 渲染引擎限制，插件无法补回未返回内容。
+- 插件侧修复（在能力范围内）：① `html_block_text` 多次解码双重/三重实体；② `sanitize_document_html` 把 `&amp;lt;` 等降为单重 XML 实体，正文正确显示 `<`；③ 新增 `sanitize_garbled_text`，标题判定与显示前清除 U+FFFD、U+FFD0+、C1 控制符、阿拉伯乱码区，乱码不再阻断章节识别、目录无残留乱码。mock 真机乱码场景验证 5 章全识别、标题干净。
+- 建议：重要 RTF 文档先另存为 `.docx` 再转换，可绕开 KOReader 的 RTF 渲染缺陷。
+
+### 6. testfiles 规格说明补全
+- `01_big/big_novel.docx` 等 8 个有效 docx 补充「测试文件规格」头与「正文结束·核对标记」（普通正文段落，不进目录），注入前后 heading 数一致（365 不变），便于真机核对内容完整性。
+
 ## v2.1.4（2026-11-17，真机第二轮反馈）
 
 依据用户上传的 `crash.log` 与各目录 `.txt2epub.log`，修复以下真机问题；全部经 Lua 5.3 / LuaJIT 双解释器回归（新增 `test/test_fixes_v214.lua` 9 项全通过）。

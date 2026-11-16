@@ -1,21 +1,18 @@
 -- inflate.lua
--- 纯 Lua 的 raw DEFLATE (RFC 1951) 解压器 —— 零依赖。
+-- 纯 Lua 的 raw DEFLATE (RFC 1951) 解压器 —— 零强制依赖。
 --
 -- 为什么需要它：
 --   .docx 是 ZIP 容器，其中 method=8 的条目存的是「裸 deflate 流」(raw deflate)，
 --   既没有 zlib 的 2 字节头 (0x78 0x9C)，也没有尾部 4 字节 adler32 校验。
---   而 KOReader 自带的 ffi/zlib.zlib_uncompress() 内部调用的是 zlib 的 uncompress()，
---   后者只接受完整的 zlib 流，喂 raw deflate 会返回 Z_DATA_ERROR 并触发
---   `assert(res == 0)` -> "ffi/zlib.lua:29: assertion failed!"。
---   KOReader 的 ffi/zlib_h.cdef 也并未声明 inflateInit2_/inflate/z_stream 等
---   raw-inflate 接口，无法借它解 ZIP 条目。
+--   KOReader 自带的 ffi/zlib.zlib_uncompress() 只接受完整 zlib 流，喂 raw deflate 会失败。
 --
--- 因此本模块用纯 Lua 直接实现 RFC 1951 解码：
---   * 不依赖 ffi / libz / bit 库 / 外部进程，任何 Lua 5.1 / 5.3 / LuaJIT 均可运行；
---     （所有位运算用算术代替，保证跨平台与跨解释器一致）
---   * 内存有界：输出采用「分块冻结 + 32KB 回溯窗口」，不会随文档体积线性膨胀成
---     百万级 Lua table 元素，避免 Kindle 等低内存设备 OOM；
---   * 不改动 STORED (method=0) 路径，两者共用上层 ZipWriter。
+-- 双路径设计（v2.1.5）：
+--   1) 快速路径：若运行环境提供 ffi + libz，直接调用 zlib 的 inflateInit2_(windowBits=-15)
+--      做 raw inflate —— C 级速度、内存峰值极小，彻底避免低性能设备（Kindle）上
+--      纯 Lua 逐字节解压大 XML 造成的 CPU 卡死与 OOM（真机 Killed）。
+--      zlib 的所有声明都包在 pcall 里，任何一步不可用都会静默回退。
+--   2) 回退路径：优化的纯 Lua 实现，输出采用「分块冻结 + 32KB 窗口 + 批量串拷贝」，
+--      兼容 Lua 5.1 / 5.3 / LuaJIT，零 C 库依赖。
 --
 -- 对外 API：
 --   inflate.raw(data [, expected_size]) -> string | nil, err
@@ -54,15 +51,13 @@ local CLORDER = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 
 
 ------------------------------------------------------------------------
 -- 位读取器：DEFLATE 位流为 LSB-first（字节内低位先出）
---   返回 bits(k)、align() 两个闭包
 ------------------------------------------------------------------------
 local function new_bitreader(data)
     local pos = 1
     local n = #data
-    local buf = 0       -- 位缓冲，最低位为下一个待消费位
-    local cnt = 0       -- 缓冲中有效位数（每次 bits() 返回后恒 < 8）
+    local buf = 0
+    local cnt = 0
 
-    -- 读取 k 位（k <= 16）并返回整数；数据耗尽返回 nil
     local function bits(k)
         while cnt < k do
             if pos > n then return nil end
@@ -77,7 +72,6 @@ local function new_bitreader(data)
         return v
     end
 
-    -- 丢弃当前字节内未消费的高位，对齐到下一字节边界（stored block 用）
     local function align()
         buf = 0
         cnt = 0
@@ -88,8 +82,6 @@ end
 
 ------------------------------------------------------------------------
 -- canonical Huffman 解码表构造（puff.c construct）
---   lengths : 1-based 数组，lengths[i] 为符号 (i-1) 的码长（0 表示未使用）
---   返回 { count=..., symbol=... }；over-subscribed 时返回 nil
 ------------------------------------------------------------------------
 local function construct(lengths, n)
     local count = {}
@@ -99,16 +91,14 @@ local function construct(lengths, n)
         if l < 0 or l > MAXBITS then return nil end
         count[l] = count[l] + 1
     end
-    count[0] = 0  -- 长度为 0 的符号不参与编码
+    count[0] = 0
 
-    -- 检查是否过度订阅（码长组合不可能构成前缀码）
     local left = 1
     for len = 1, MAXBITS do
         left = left * 2 - count[len]
         if left < 0 then return nil end
     end
 
-    -- offs[len] = 码长为 len 的第一个符号在 symbol 表中的 0-based 位置
     local offs = { [1] = 0 }
     for len = 1, MAXBITS - 1 do
         offs[len + 1] = offs[len] + count[len]
@@ -117,7 +107,7 @@ local function construct(lengths, n)
     for i = 1, n do
         local l = lengths[i] or 0
         if l ~= 0 then
-            symbol[offs[l] + 1] = i - 1   -- 存 0-based 符号值
+            symbol[offs[l] + 1] = i - 1
             offs[l] = offs[l] + 1
         end
     end
@@ -130,9 +120,9 @@ local function decode(h, bits)
     for len = 1, MAXBITS do
         local b = bits(1)
         if not b then return nil end
-        code = code + b                       -- 等价于 code |= b（低位此刻必为 0）
+        code = code + b
         local count = h.count[len]
-        if code - count < first then          -- code < first + count
+        if code - count < first then
             return h.symbol[index + (code - first) + 1]
         end
         index = index + count
@@ -149,13 +139,13 @@ local fixed_lit, fixed_dist
 local function init_fixed()
     if fixed_lit then return end
     local l = {}
-    for i = 1, 144 do l[i] = 8 end       -- 符号   0..143
-    for i = 145, 256 do l[i] = 9 end    -- 符号 144..255
-    for i = 257, 280 do l[i] = 7 end    -- 符号 256..279
-    for i = 281, 288 do l[i] = 8 end    -- 符号 280..287
+    for i = 1, 144 do l[i] = 8 end
+    for i = 145, 256 do l[i] = 9 end
+    for i = 257, 280 do l[i] = 7 end
+    for i = 281, 288 do l[i] = 8 end
     fixed_lit = construct(l, 288)
     local d = {}
-    for i = 1, 32 do d[i] = 5 end        -- 32 个距离码，均为 5 位
+    for i = 1, 32 do d[i] = 5 end
     fixed_dist = construct(d, 32)
 end
 
@@ -171,7 +161,6 @@ local function dynamic_tables(bits)
     v = bits(4); if not v then return nil end
     local hclen = v + 4
 
-    -- 码长码的码长表（19 个符号）
     local cll = {}
     for i = 1, 19 do cll[i] = 0 end
     for i = 1, hclen do
@@ -181,7 +170,6 @@ local function dynamic_tables(bits)
     local clh = construct(cll, 19)
     if not clh then return nil end
 
-    -- 解出 hlit + hdist 个码长（含 16/17/18 游程）
     local lengths = {}
     local total = hlit + hdist
     local i = 1
@@ -228,7 +216,103 @@ local function dynamic_tables(bits)
 end
 
 ------------------------------------------------------------------------
+-- 快速路径：ffi + libz 的 raw inflate（windowBits = -15）
+-- 任何环节不可用 / 报错都返回 nil，由调用方回退纯 Lua。
+------------------------------------------------------------------------
+local ffi_zlib -- 缓存已成功初始化的 {z, version, cdef_size}
+local ffi_zlib_tried = false
+
+local function try_ffi_inflate(data, expected_size)
+    if ffi_zlib_tried and not ffi_zlib then return nil end
+    local ok = pcall(function()
+        if not ffi_zlib then
+            local ffi = require("ffi")
+            -- 分块声明：即使 KOReader 已声明过部分符号也不会整体回退。
+            -- 类型/函数均加 inflate_ 独特前缀，避免与 ffi/zlib.lua 的 z_stream 等冲突。
+            pcall(ffi.cdef, [[
+                typedef unsigned char inflate_byte;
+                typedef unsigned int  inflate_uint;
+                typedef unsigned long inflate_ulong;
+                typedef void* (*inflate_alloc)(void*, inflate_uint, inflate_uint);
+                typedef void  (*inflate_free)(void*, void*);
+                typedef struct inflate_z_stream_s {
+                    inflate_byte* next_in;
+                    inflate_uint  avail_in;
+                    inflate_ulong total_in;
+                    inflate_byte* next_out;
+                    inflate_uint  avail_out;
+                    inflate_ulong total_out;
+                    char*         msg;
+                    void*         state;
+                    inflate_alloc zalloc;
+                    inflate_free  zfree;
+                    void*         opaque;
+                    int           data_type;
+                    inflate_ulong adler;
+                    inflate_ulong reserved;
+                } inflate_z_stream;
+            ]])
+            pcall(ffi.cdef, "int inflateInit2_(inflate_z_stream*, int, const char*, int);")
+            pcall(ffi.cdef, "int inflate(inflate_z_stream*, int);")
+            pcall(ffi.cdef, "int inflateEnd(inflate_z_stream*);")
+            local z = ffi.load("z")
+            -- 版本字符串：优先调用 zlibVersion（KOReader 可能已声明），失败则用通用值。
+            -- inflateInit2_ 只按主/次版本宽松校验，1.2.11 可匹配绝大多数 zlib 1.2.x。
+            pcall(ffi.cdef, "const char* zlibVersion(void);")
+            local version = "1.2.11"
+            pcall(function()
+                local v = ffi.string(z.zlibVersion())
+                if v and v ~= "" then version = v end
+            end)
+            ffi_zlib = { ffi = ffi, z = z, version = version }
+        end
+    end)
+    ffi_zlib_tried = true
+    if not ok or not ffi_zlib then return nil end
+
+    local ffi, z, version = ffi_zlib.ffi, ffi_zlib.z, ffi_zlib.version
+    local result, ok2 = nil, pcall(function()
+        local strm = ffi.new("inflate_z_stream")
+        local nin = #data
+        local cin = ffi.new("inflate_byte[?]", nin)
+        ffi.copy(cin, data, nin)
+        strm.next_in = ffi.cast("inflate_byte*", cin)
+        strm.avail_in = nin
+        -- windowBits = -15 : raw deflate（无 zlib 头、无 adler32 尾）
+        local ret = z.inflateInit2_(strm, -15, version, ffi.sizeof("inflate_z_stream"))
+        if ret ~= 0 then error("inflateInit2_ failed: " .. tostring(ret)) end
+        local CHUNK = 65536
+        local cout = ffi.new("inflate_byte[?]", CHUNK)
+        local parts, nparts = {}, 0
+        while true do
+            strm.next_out = ffi.cast("inflate_byte*", cout)
+            strm.avail_out = CHUNK
+            ret = z.inflate(strm, 4)  -- Z_FINISH
+            local produced = CHUNK - strm.avail_out
+            if produced > 0 then
+                nparts = nparts + 1
+                parts[nparts] = ffi.string(cout, produced)
+            end
+            if ret == 1 then break end       -- Z_STREAM_END
+            if ret ~= 0 then
+                z.inflateEnd(strm)
+                error("inflate failed: " .. tostring(ret))
+            end
+        end
+        z.inflateEnd(strm)
+        result = table.concat(parts, "", 1, nparts)
+        parts = nil
+    end)
+    if not ok2 or not result then return nil end
+    if expected_size and expected_size >= 0 and #result ~= expected_size then
+        return nil  -- 长度不符：不信任 ffi 结果，回退纯 Lua 复核
+    end
+    return result
+end
+
+------------------------------------------------------------------------
 -- 主入口：解压一段裸 deflate 流
+--   优先 ffi zlib（快、省内存）；不可用则回退优化的纯 Lua。
 ------------------------------------------------------------------------
 function inflate.raw(data, expected_size)
     if type(data) ~= "string" then
@@ -239,43 +323,70 @@ function inflate.raw(data, expected_size)
         return nil, "deflate 数据为空"
     end
 
-    local bits, align = new_bitreader(data)
+    -- 快速路径（Kindle 等低性能设备上至关重要）
+    local fast = try_ffi_inflate(data, expected_size)
+    if fast then return fast end
 
-    -- 有界输出：chunks 保存已冻结的块；buf 保留最近 ≤ WINDOW+FLUSH 字节供 LZ77 回溯
-    local WINDOW, FLUSH = 32768, 4096
-    local chunks, nchunks = {}, 0
-    local buf, nbuf = {}, 0
+    --------------------------------------------------------------------
+    -- 回退路径：纯 Lua，分块冻结 + 32KB 窗口 + 批量串拷贝
+    --   out      : 已冻结输出块（字符串）
+    --   cur      : 尚未冻结的字面量字节表
+    --   hist     : 最近 ≤ WINDOW 字节的回溯窗口（字符串，供 LZ77 批量复制）
+    --------------------------------------------------------------------
+    local bits, align = new_bitreader(data)
+    local WINDOW, FLUSH = 32768, 8192
+    local out, nout = {}, 0
+    local cur, ncur = {}, 0
+    local hist = ""
     local total = 0
 
-    local function freeze_old()
-        local t = {}
-        for i = 1, FLUSH do t[i] = buf[i] end
-        nchunks = nchunks + 1
-        chunks[nchunks] = table.concat(t)
-        local nb = {}
-        for i = FLUSH + 1, nbuf do nb[i - FLUSH] = buf[i] end
-        buf = nb
-        nbuf = nbuf - FLUSH
+    local function flush_cur()
+        if ncur == 0 then return end
+        local s = table.concat(cur, "", 1, ncur)
+        nout = nout + 1; out[nout] = s
+        local hl = #hist
+        if hl + ncur <= WINDOW then
+            hist = hist .. s
+        else
+            local keep = WINDOW - ncur
+            if keep > 0 then hist = hist:sub(hl - keep + 1) .. s
+            else hist = s:sub(-WINDOW) end
+        end
+        cur, ncur = {}, 0
     end
 
-    local function put(ch)
-        nbuf = nbuf + 1
-        buf[nbuf] = ch
+    local function put(b)
+        ncur = ncur + 1; cur[ncur] = string.char(b)
         total = total + 1
-        if nbuf > WINDOW + FLUSH then freeze_old() end
+        if ncur >= FLUSH then flush_cur() end
     end
 
-    local function finish()
-        local t = {}
-        for i = 1, nbuf do t[i] = buf[i] end
-        nchunks = nchunks + 1
-        chunks[nchunks] = table.concat(t)
-        return table.concat(chunks)
+    -- LZ77 重叠复制：用 string.rep 一次性生成，避免逐字节循环
+    local function copy_match(dist, len)
+        flush_cur()
+        local hl = #hist
+        if dist > hl then return false end
+        local pat = hist:sub(hl - dist + 1, hl)
+        local pl = #pat
+        local rep
+        if len <= pl then
+            rep = pat:sub(1, len)
+        else
+            rep = pat:rep(math.ceil(len / pl)):sub(1, len)
+        end
+        nout = nout + 1; out[nout] = rep
+        local nl = #rep
+        if hl + nl <= WINDOW then
+            hist = hist .. rep
+        else
+            local keep = WINDOW - nl
+            if keep > 0 then hist = hist:sub(hl - keep + 1) .. rep
+            else hist = rep:sub(-WINDOW) end
+        end
+        total = total + len
+        return true
     end
 
-    --------------------------------------------------------------------
-    -- 逐 block 解码
-    --------------------------------------------------------------------
     while true do
         local final = bits(1)
         if not final then return nil, "数据意外结束（块头 BFINAL）" end
@@ -283,7 +394,6 @@ function inflate.raw(data, expected_size)
         if not btype then return nil, "数据意外结束（块类型 BTYPE）" end
 
         if btype == 0 then
-            -- STORED：对齐到字节，LEN / NLEN / 原始数据
             align()
             local len = bits(16)
             if not len then return nil, "数据意外结束（STORED LEN）" end
@@ -295,7 +405,7 @@ function inflate.raw(data, expected_size)
             for _ = 1, len do
                 local b = bits(8)
                 if not b then return nil, "数据意外结束（STORED 数据）" end
-                put(string.char(b))
+                put(b)
             end
 
         elseif btype == 1 or btype == 2 then
@@ -313,9 +423,9 @@ function inflate.raw(data, expected_size)
                 local sym = decode(lh, bits)
                 if not sym then return nil, "字面/长度码解码失败" end
                 if sym < 256 then
-                    put(string.char(sym))
+                    put(sym)
                 elseif sym == 256 then
-                    break  -- 块结束
+                    break
                 else
                     local li = sym - 257 + 1
                     if li < 1 or li > 29 then
@@ -333,14 +443,11 @@ function inflate.raw(data, expected_size)
                     local dextra = bits(DEXT[dsym + 1])
                     if not dextra then return nil, "数据意外结束（距离附加位）" end
                     local dist = DBASE[dsym + 1] + dextra
-                    if dist > total or dist > nbuf then
-                        return nil, "回溯距离超出已输出数据/窗口"
+                    if dist > total then
+                        return nil, "回溯距离超出已输出数据"
                     end
-
-                    -- LZ77 重叠复制：源位置随写入向前滑动
-                    for _ = 1, length do
-                        local src = buf[nbuf - dist + 1]
-                        put(src)
+                    if not copy_match(dist, length) then
+                        return nil, "回溯距离超出窗口"
                     end
                 end
             end
@@ -351,7 +458,8 @@ function inflate.raw(data, expected_size)
         if final == 1 then break end
     end
 
-    local result = finish()
+    flush_cur()
+    local result = table.concat(out, "", 1, nout)
     if expected_size and expected_size >= 0 and #result ~= expected_size then
         return nil, string.format("解压大小不符：得到 %d 字节，预期 %d 字节", #result, expected_size)
     end

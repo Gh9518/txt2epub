@@ -843,11 +843,105 @@ end
 --   * 去首尾空白
 --   * 剥离 === / —— 等包裹符（如「=== 第4章 风起 ===」→「第4章 风起」），
 --     否则目录里会出现多余的「===」（真机 title_punct.txt 反馈）。
+--   * v2.1.5：把「第X章/卷/节 + 标点分隔符 + 标题」中的分隔符统一成单个空格，
+--     让目录整洁有序（「第1章：开端」→「第1章 开端」，「第六卷 - 狂暴」→「第六卷 狂暴」，
+--     「第5章、归途」→「第5章 归途」）。括号及其内容（（）""[]《》【】〈〉〔〕［］「」｛｝『』〖〗）
+--     属于标题本身，一律保留，不视为分隔符。
 -- 注意：不做 normalize_title_ws —— 保留原文里的 U+3000 全角空格，
 --      与「目录文本保留原文」的既有承诺一致。
+-- 分隔符：逐项列举（避免在多字节字符类里混入 UTF-8 破坏匹配）。
+--   —— 特意不含任何成对括号，避免误伤「第2章（上）」这类标题。
+local TITLE_SEPS = {
+    "：", ":", "、", "，", ",", "。", "·", "・",
+    "－", "-", "–", "—", "~", "～", "/", "＼", "｜", "|", "　",
+}
+local function is_title_sep_bytewise(rest)
+    -- 返回 (剩余内容) 若 rest 以「真实标点」开头（可夹带空白）；否则 nil。
+    -- 关键：若分隔符只是空白（ASCII 空格 / U+3000 全角空格），保持原样返回 nil，
+    --       以遵守「目录文本保留原文全角空格」的既有承诺（dom_unicode 用例依赖）。
+    local consumed = 0
+    local has_punct = false
+    while true do
+        local matched = false
+        for _, sep in ipairs(TITLE_SEPS) do
+            if sep ~= "　" and rest:sub(consumed + 1, consumed + #sep) == sep then
+                consumed = consumed + #sep
+                has_punct = true
+                matched = true
+                break
+            end
+        end
+        if not matched then
+            -- 吞掉 ASCII / 全角空白（但单独存在不算标点）
+            local c = rest:sub(consumed + 1, consumed + 1)
+            if c and c:match("%s") then consumed = consumed + 1; matched = true
+            elseif rest:sub(consumed + 1, consumed + 3) == "　" then consumed = consumed + 3; matched = true end
+        end
+        if not matched then break end
+    end
+    if consumed == 0 or not has_punct then return nil end
+    return rest:sub(consumed + 1)
+end
+
+-- 章节量词（多字节中文，不能用 Lua 字符类，须显式列举逐个匹配）
+local CN_MARKERS = { "章", "回", "卷", "部", "册", "篇", "集", "幕", "期", "节" }
+local CN_DIGITS = { "零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+                    "百", "千", "两", "〇", "壹", "贰", "叁", "肆", "伍", "陆", "柒",
+                    "捌", "玖", "拾", "廿", "卅" }
+
+local function tidy_chapter_punct(s)
+    -- 中文：行首「第 <数字/中文数字等> <章节量词>」之后若紧跟分隔符，统一成单个空格
+    local di = "第"
+    if s:sub(1, #di) == di then
+        local p = #di + 1
+        -- 跳过数字：ASCII 数字逐字节，中文数字按完整串
+        while p <= #s do
+            local c = s:sub(p, p)
+            if c:match("%d") or c == " " then
+                p = p + 1
+            else
+                local adv = nil
+                for _, d in ipairs(CN_DIGITS) do
+                    if s:sub(p, p + #d - 1) == d then adv = #d; break end
+                end
+                if adv then p = p + adv else break end
+            end
+        end
+        -- 在 p 处尝试匹配一个量词
+        for _, mk in ipairs(CN_MARKERS) do
+            if s:sub(p, p + #mk - 1) == mk then
+                local rest = s:sub(p + #mk)
+                if rest ~= "" then
+                    local body = is_title_sep_bytewise(rest)
+                    if body and body ~= "" then
+                        return s:sub(1, p + #mk - 1) .. " " .. trim(body)
+                    end
+                end
+                break
+            end
+        end
+    end
+    -- 英文：Chapter/Part/Volume/Section/Book + 序号 + 分隔符（如 "Chapter 1: The Beginning"）
+    local en_patterns = {
+        "^([Cc]hapter%s+[%w]+)(.*)$", "^([Ss]ection%s+[%w]+)(.*)$",
+        "^([Pp]art%s+[%w]+)(.*)$", "^([Vv]olume%s+[%w]+)(.*)$",
+        "^([Bb]ook%s+[%w]+)(.*)$",
+    }
+    for _, pat in ipairs(en_patterns) do
+        local ehead, erest = s:match(pat)
+        if ehead and erest and erest ~= "" then
+            local body = is_title_sep_bytewise(erest)
+            if body and body ~= "" then return ehead .. " " .. trim(body) end
+        end
+    end
+    return s
+end
+
 local function clean_title_text(line)
     line = trim(line or "")
     line = line:gsub("^=+%s*", ""):gsub("%s*=+$", "")
+    line = trim(line)
+    line = tidy_chapter_punct(line)
     return trim(line)
 end
 function Converter.clean_title_text(line)
@@ -2252,6 +2346,12 @@ local function sanitize_document_html(html)
     html = html:gsub("<script.->.-</script>", "")
     html = html:gsub("</?html[^>]*>", "")
     html = html:gsub("</?body[^>]*>", "")
+    -- KOReader 对 .rtf/.fb2 常产生双重转义（&amp;lt; / &amp;gt; / &amp;amp;），
+    -- 读者会看到「&lt;」字面量。这里把它们降为单重 XML 实体（&lt; 在 XHTML 中
+    -- 会正确显示为 <），不动已是单重的实体，避免破坏标签结构。
+    html = html:gsub("&amp;lt;", "&lt;"):gsub("&amp;gt;", "&gt;")
+    html = html:gsub("&amp;quot;", "&quot;"):gsub("&amp;apos;", "&apos;")
+    html = html:gsub("&amp;amp;", "&amp;")
     return (html:gsub("^%s+", ""))
 end
 
@@ -2341,8 +2441,15 @@ local function html_block_text(frag)
     -- 若在这里先归一化，写进目录/标题的就会是改造过的文本，与原文不一致。
     local t = frag
     t = t:gsub("<[^>]*>", "")
-    t = t:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
-         :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+    -- 反复解码实体：KOReader 对 .rtf/.fb2 常产生双重/三重转义（&amp;lt; -> &lt; -> <），
+    -- 只解一次会让读者看到「&lt;」字面量（真机 dom_sample.rtf 图2 反馈）。
+    -- 最多 3 轮，并在本轮无任何变化时提前退出，避免对普通文本做无谓扫描。
+    for _ = 1, 3 do
+        local before = t
+        t = t:gsub("&nbsp;", " "):gsub("&amp;", "&"):gsub("&lt;", "<")
+             :gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&apos;", "'")
+        if t == before then break end
+    end
     local function cp(u)
         if not u or u ~= u or u < 0 or u > 0x10FFFF
             or (u >= 0xD800 and u <= 0xDFFF) then
@@ -2416,6 +2523,29 @@ local function html_to_blocks(html)
     return blocks
 end
 
+-- 清洗 KOReader 渲染 .rtf/.fb2 时产生的乱码字符，用于「标题判定」与显示文本。
+-- 典型：U+FFFD 替换符、U+FFD0..U+FFF9 乱码区、U+0080..U+009F 的 C1 控制字符
+-- （真机 dom_sample.rtf 第二章标题后出现阿拉伯乱码 / ￔ，正文混入此类字符）。
+-- 只替换不可读的孤立乱码为空格，不动正常中文/英文/标点，避免整章因个别乱码丢失。
+local function sanitize_garbled_text(s)
+    if not s or s == "" then return s end
+    -- U+FFFD (EF BF BD) 与 U+FFD0..U+FFFF 区（EF BF 90..EF BF BF 等）→ 空格
+    s = s:gsub("\239\191[\189\190\191]", " ")
+    s = s:gsub("\239\191[%128-\255]", " ")
+    -- C1 控制字符 U+0080..U+009F (C2 80..C2 9F) → 空格
+    s = s:gsub("\194[%128-\159]", " ")
+    -- 阿拉伯字母区 U+0600..U+06FF（UTF-8 两字节 D8 80..DB BF）：RTF 负 \u 码点
+    -- 被 KOReader 误渲染成阿拉伯字符（图2「第二章 ف」）→ 空格
+    s = s:gsub("\216[%128-\191]", " ")
+    s = s:gsub("\217[%128-\191]", " ")
+    s = s:gsub("\218[%128-\191]", " ")
+    s = s:gsub("\219[%128-\191]", " ")
+    -- 孤立的 0xEF/0xBF 残缺字节序列（畸形 UTF-8）→ 空格
+    s = s:gsub("\239\191", " ")
+    return (s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+Converter.sanitize_garbled_text = sanitize_garbled_text
+
 -- 识别到 >= 2 个标题才重切：避免正文里偶然出现一行「第X章」就破坏原结构。
 -- 首个标题之前的正文并入第一章开头（与 .txt 路径 build_chapters 一致）。
 -- 返回 (chapters|nil, 识别到的标题数)
@@ -2433,8 +2563,11 @@ local function resplit_chapters_by_heading(chapters, book_title)
     local function heading_of(b)
         local t = b.text
         if t == "" or #t > 80 then return nil, nil end
-        if Converter.is_chapter_title(t) then return t, Converter.title_level(t) end
-        if b.heading then return t, b.heading end
+        -- 判定与显示都用「去乱码」文本：真机 RTF 标题后跟阿拉伯乱码时仍能识别，
+        -- 且目录里不会残留 U+FFFD / 控制字符（图2 反馈）。
+        local clean = sanitize_garbled_text(t)
+        if Converter.is_chapter_title(clean) then return clean, Converter.title_level(clean) end
+        if b.heading then return clean, b.heading end
         return nil, nil
     end
 
