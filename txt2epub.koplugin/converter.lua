@@ -1683,7 +1683,9 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
                 local px = Converter.build_chapter_xhtml(t, chunk, indent, level)
                 local fname = string.format("OEBPS/chapter_%04d%s.xhtml", i, (part == 1) and "" or ("_" .. part))
                 zip:add(fname, px)
-                toc[#toc + 1] = { file = fname, title = t, level = level, toc = (part == 1) }
+                -- 所有分片都进目录：与其他格式(paragraphs/DOM)保持一致，
+                -- 便于真机逐片核对内容完整（真机反馈「TXT 超长章不分割 / 目录缺片」）。
+                toc[#toc + 1] = { file = fname, title = t, level = level, toc = true }
                 part = part + 1
                 chunk = {}
                 size = 0
