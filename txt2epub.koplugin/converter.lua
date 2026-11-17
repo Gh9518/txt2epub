@@ -2262,6 +2262,56 @@ function Converter.build_epub_from_docx(path, out_path, opts, hooks)
 end
 
 ------------------------------------------------------------------------
+-- 9d-1a-2. RTF 入口（v2.1.6）：插件直接解析源文件，不依赖 KOReader DOM。
+--   KOReader 对负数 \u 转义的 RTF 会在该处乱码/截断，导致目录与正文缺失；
+--   rtf.lua 自行解码 \u（含负数）、\par、\b，拿到完整标题与正文。
+--   返回第三个值 stats（含 garbled/headings/body_paras）供日志与提示。
+------------------------------------------------------------------------
+function Converter.build_epub_from_rtf(path, out_path, opts, hooks)
+    opts = opts or {}
+    hooks = hooks or {}
+    local ok, RtfReader = pcall(require, "rtf")
+    if not ok or not RtfReader then
+        error("无法加载 RTF 解析模块（rtf.lua 缺失）")
+    end
+    local doc, derr = RtfReader.read(path)
+    if not doc then
+        error("读取 RTF 文档失败：" .. tostring(derr))
+    end
+    local book_title = doc.title or opts.book_title or "未命名"
+    local paragraphs = doc.paragraphs or {}
+    local garbled = doc.garbled or 0
+    doc.paragraphs = nil
+    doc = nil
+    collectgarbage("step")
+
+    -- 标题兜底：若 rtf.lua 未识别到任何标题（非粗体标题写法），从正文文本恢复
+    local has_heading = false
+    for _, p in ipairs(paragraphs) do
+        if p and p.kind == "heading" then has_heading = true break end
+    end
+    local rst
+    if not has_heading then
+        paragraphs, rst = Converter.recover_docx_headings(paragraphs, opts)
+    end
+
+    local headings, body_paras = 0, 0
+    for _, p in ipairs(paragraphs) do
+        if p and p.kind == "heading" then headings = headings + 1
+        elseif p and p.kind == "body" then body_paras = body_paras + 1 end
+    end
+
+    local bok, cnt, stats = Converter.build_epub_from_paragraphs(
+        paragraphs, book_title, out_path, opts, hooks)
+    stats = stats or {}
+    stats.garbled = garbled
+    stats.headings = headings
+    stats.body_paras = body_paras
+    stats.recovery = rst
+    return bok, cnt, stats
+end
+
+------------------------------------------------------------------------
 -- 9d-1b. Markdown / HTML 入口：插件自解析，不依赖 KOReader DOM
 ------------------------------------------------------------------------
 function Converter.build_epub_from_markup(path, out_path, opts, hooks)

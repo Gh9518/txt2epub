@@ -2,6 +2,26 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.6（2026-11-17，真机第四轮反馈：崩溃仍在 + RTF 目录不全）
+
+依据用户新一轮上传的 `crash (1).log`/`crash (2).log`、`domtxt2epub.log`、`txt2epub(1).log` 修复；新增 `test/test_fixes_v216.lua`（16 项双解释器全通过），`test_routing` 更新至 26 项全通过。
+
+### 1. 压缩版 .docx 崩溃「仍然存在」—— 真凶是 v2.1.5 的 FFI zlib 快路径
+- **定位**：`crash (2).log` 第 121-123 行明确记录 `ffi.load: z` 之后紧接 `Killed`（内核 OOM，无 Lua 堆栈）；`txt2epub.log` 最后一行停在 08:33:44「开始由 Word 生成 EPUB」无下文。即崩溃发生在 v2.1.5 新增的 FFI raw-inflate 快路径内。
+- **根因**：v2.1.5 用自定义 cdef 的 `inflate_z_stream` 结构体调用 libz 的 `inflateInit2_/inflate`。但 KOReader 真机（Kindle PW4）已通过自身 `ffi/zlib.lua` 声明过同名 C 符号与 `z_stream` 结构，在 32 位 ARM ABI 下符号/结构体解析错位，`strm.avail_out` 读到错误值 → `produced = CHUNK - avail_out` 计算异常 → 输出块 `parts` 无限 append 直至内存耗尽。`big_novel.docx`（24 倍压缩）与 `long_chapter.docx`（70 倍压缩）压缩率越高越易触发。本地开发环境无 KOReader 的 zlib 声明、且为 64 位 ABI，故 v2.1.5 本地测试（FFI 0.09s 完成）完全测不出——这正是该 bug 逃逸到真机的原因。而 v2.1.4 的纯 Lua 版本曾在真机成功转换同一 `big_novel.docx`（`txt2epub(1).log` 22:28:58，368 章）。
+- **修复**：`inflate.lua` **彻底移除 FFI 快路径**，回归经真机验证的纯 Lua 实现（分块冻结 + 32KB 窗口 + `string.rep` 批量 LZ77 复制，本地实测 2.8MB / ~1s、内存峰值约 5MB），并新增**熔断保护**：输出总量（有 ZIP 记录大小时 = 其 +1KB，否则 128MB 上限）与迭代次数（1200 万）任一越界，立即返回明确错误而非无限 append。坏数据/异常流只会得到「解压失败」友好提示，绝不再把 KOReader 拖崩。`test_inflate` 30 项全通过。
+- **效果权衡**：纯 Lua 比 FFI 略慢，但真机数秒即可完成，稳定性远重于微小速度差；彻底消除 `ffi.load: z → Killed` 崩溃点。
+
+### 2. RTF 目录不全 / 乱码截断 —— 改为插件自解析源文件，不再依赖 KOReader DOM
+- **现象**：`dom_sample.rtf` 真机转换后目录仅 2 章、正文缺失；`domtxt2epub.log` 显示「可见正文 968 字符 / 章节 2」（源文件应有 6 个标题 + 多段正文）。
+- **根因**：RTF 里「第二章 远行」等标题与正文使用 RTF 的**负数 `\u` 转义**（如 `\u-28708?\u-30644?`，负数需 +65536 得到码点）。KOReader CreDocument 的 RTF 渲染器无法正确解析负数 `\u`，在该处乱码并截断 DOM，只返回前 968 字符。`v2.1.5` 的乱码清洗只能清理已返回内容，无法补回 DOM 未返回的部分。
+- **修复**：新增 `rtf.lua`，像 `.docx` 一样**直接解析磁盘源文件**：正确解码 `\u`（含负数 +65536）、`\ucN` 替代字节数、`\par` 段落、`\b/\b0` 粗体标题、`\'XX` 十六进制字节；过滤字体表/颜色表等忽略组（如 `{\fonttbl...SimSun;}`）。**「忽略乱码取可用部分」**：单个无法解码的码点降级为 U+FFFD 占位符，不影响其余内容。`.rtf` 加入自解析扩展名，走独立 `build_epub_from_rtf` 流水线（协程逐章 yield、错误友好提示）。
+- **效果**：真机 `dom_sample.rtf` 端到端验证 —— 目录完整含「第一卷 少年时 / 第一章 开端 / 第一节 清晨 / 第二章 远行 / 第三章 归来」，之前乱码截断处正文全部保留，`garbled=0`。若未来遇到解析后正文极少的异常文档，仍由顶层空结果体检拦截并提示（遵循用户「无法解决就弹窗提示」的诉求）。
+
+### 3. 代码梳理与体积/效率
+- 通读 `inflate/docx/converter/main/rtf/markup/gbk` 全部逻辑，确认 `.docx` 流水线已是逐段置空 + 流式写盘（ZipWriter 边写边落盘，不驻留整书），无额外冗余；移除 FFI 后 `inflate.lua` 反而更精简。
+- 各转换入口（txt/docx/rtf/markup）统一在转换前做两轮全量 GC；收尾彻底回收，缓解连续大文件转换的内存累积。
+
 ## v2.1.5（2026-11-17，真机第三轮反馈 + 体积优化）
 
 依据新一轮 `crash.log`（05:59/06:01/06:03 `big_novel.docx`、06:30 `long_chapter.docx` 转换后约 8~14 秒 `Killed`）与两张真机截图修复；新增 `test/test_fixes_v215.lua`（21 项双解释器全通过）。

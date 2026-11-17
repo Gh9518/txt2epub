@@ -1,6 +1,6 @@
 # txt2epub —— KOReader 插件：TXT / Word / Markdown / HTML 一键转 EPUB
 
-在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成一个**带格式标记的 `.epub`**（如 `big_novel_txt.epub` / `big_novel_docx.epub`，保存在原文件同一目录；**v2.1.2 起按源格式加标记，同名不同格式不再互相覆盖**）。插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 直接解析 OOXML；`.html` / `.htm` / `.md` 由 `markup.lua` 直接解析源文件；`.doc` / RTF / FB2 / EPUB 等由 KOReader 已打开的文档内容兜底。生成的 EPUB 带有可跳转的**多级章节目录**（EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`）与内置排版精修。
+在 KOReader 中打开一个文档，通过「**工具 › TXT2EPUB**」一键把它转换成一个**带格式标记的 `.epub`**（如 `big_novel_txt.epub` / `big_novel_docx.epub`，保存在原文件同一目录；**v2.1.2 起按源格式加标记，同名不同格式不再互相覆盖**）。插件内部自动选最可靠的方式：`.txt` 走标题/缩进识别；`.docx` 直接解析 OOXML；`.html` / `.htm` / `.md` 由 `markup.lua` 直接解析源文件；`.rtf` 由 `rtf.lua` 直接解析源文件（**v2.1.6 起**，正确解码负数 `\u` 转义，绕开 KOReader DOM 的乱码/截断）；`.doc` / FB2 / EPUB 等由 KOReader 已打开的文档内容兜底。生成的 EPUB 带有可跳转的**多级章节目录**（EPUB3 `nav.xhtml` + EPUB2 `toc.ncx`）与内置排版精修。
 
 > 借鉴的开源项目与具体代码，见文末「致谢与开源借鉴」。命名建议见「七、更名方案」。
 
@@ -8,7 +8,7 @@
 
 ## English Overview
 
-**txt2epub** is a KOReader plugin that converts a document into a polished `.epub` with **one tap** (menu **Tools › TXT2EPUB**). It picks the most reliable path automatically: `.txt` uses title/indent detection; `.docx` is parsed **directly from OOXML**; `.html`/`.htm`/`.md` are parsed by the plugin's own `markup.lua`; `.doc`/RTF/FB2/EPUB fall back to the document KOReader already opened. The result ships with a real multi-level TOC (both EPUB3 `nav.xhtml` and EPUB2 `toc.ncx`) and typography presets inspired by other open-source KOReader plugins.
+**txt2epub** is a KOReader plugin that converts a document into a polished `.epub` with **one tap** (menu **Tools › TXT2EPUB**). It picks the most reliable path automatically: `.txt` uses title/indent detection; `.docx` is parsed **directly from OOXML**; `.html`/`.htm`/`.md` are parsed by the plugin's own `markup.lua`; `.rtf` is parsed by the plugin's own `rtf.lua` (**v2.1.6+**, correctly decoding negative `\u` escapes instead of relying on KOReader's DOM); `.doc`/FB2/EPUB fall back to the document KOReader already opened. The result ships with a real multi-level TOC (both EPUB3 `nav.xhtml` and EPUB2 `toc.ncx`) and typography presets inspired by other open-source KOReader plugins.
 
 ### Highlights
 - **One-tap, many formats** — `.txt`, `.docx`, `.html`, `.htm`, `.md` are parsed by the plugin itself (no dependency on KOReader's parser); other reader-supported formats use KOReader's parsed document as a fallback, with an empty-result guard instead of silently producing an empty book.
@@ -26,7 +26,8 @@
 - **Inline-tag HTML headings (v2.1.4)** — HTML whose headings live only inside `<span>` (no `<hN>`) now recovers a multi-level TOC from short chapter-like lines.
 - **Long single-line TXT (v2.1.4)** — indent mode splits an over-long heading-free line into byte-sized parts, each listed in the TOC, instead of one giant empty TOC entry.
 - **EPUB re-convert guard (v2.1.4)** — converting an already-converted `.epub` asks for confirmation first, avoiding a nested duplicate TOC on a mis-tap.
-- **Fast raw-DEFLATE via zlib (v2.1.5)** — compressed `.docx` is now inflated by libz through ffi (C speed, tiny memory peak), fixing the "converted then Killed" OOM on slow devices; falls back to an optimized pure-Lua decoder when ffi/zlib is unavailable.
+- **Stable raw-DEFLATE (v2.1.6)** — compressed `.docx` is inflated by an optimized, bounded pure-Lua decoder with hard output/iteration guards. v2.1.5 briefly used libz via ffi for speed, but on real Kindle devices KOReader's own zlib declarations collided with the plugin's cdef (32-bit ABI), causing `ffi.load: z → Killed` OOM; v2.1.6 removed that path and returned to the device-proven pure-Lua decoder, so a corrupt/odd stream now yields a friendly error instead of crashing the reader.
+- **Direct RTF parsing (v2.1.6)** — `.rtf` is now parsed from the source file by `rtf.lua` (negative `\u` escapes, `\par`, `\b` headings) instead of KOReader's DOM, which garbled and truncated chapters containing negative `\u` codes; full TOC and body are preserved.
 - **Smaller footprint (v2.1.5)** — the GB2312 table is base64-encoded and lazily decoded, shrinking `gbk.lua` from 62 KB to 27 KB and the plugin package accordingly.
 - **Cleaner TOC titles (v2.1.5)** — punctuation between a chapter marker and its title (`第1章：开端`, `第六卷 - 狂暴`) becomes a single space; brackets and full-width spaces are preserved.
 
@@ -66,7 +67,8 @@
 | `.docx` | 插件自解析 OOXML | Word 标题样式（Heading1/2/3… 与 Title）；**v2.1.1：样式为 0 时自动从正文文本恢复章节标题** |
 | `.md` / `.markdown` | 插件自解析 `markup.lua` | `#` ~ `######`、Setext 标题 |
 | `.html` / `.htm` | 插件自解析 `markup.lua` | `<title>` 作书名、`<h1>`~`<h6>` 作多级标题 |
-| `.doc` / RTF / FB2 / EPUB | KOReader 已打开文档的 DOM 兜底 | 优先用 `getToc()`；为 0 时从正文识别标题重切分 |
+| `.rtf` | 插件自解析 `rtf.lua`（v2.1.6 起，不经 KOReader DOM） | `\b` 粗体段 + 章节规则；正确解码负数 `\u` 转义，目录/正文完整 |
+| `.doc` / FB2 / EPUB | KOReader 已打开文档的 DOM 兜底 | 优先用 `getToc()`；为 0 时从正文识别标题重切分 |
 
 **转换进度**：先显示「正在识别章节…」，再显示「正在写入… + 进度条 + 已写入 N 章」；全程常驻进度框，完成即自动关闭。诊断日志写在**源文件同目录**的隐藏文件 `.txt2epub.log`（需在文件管理器开启「显示隐藏文件」；每次转换追加写入，超 512 KB 自动清空重建）。日志含「TOC 条目 / 正文标题数 / 重切分方式 / DOM HTML 样本（前 160 字节）」，便于定位真机差异。
 
@@ -116,7 +118,8 @@
 - 非常规章节写法（如纯日期、自定义符号）需通过「设置章节标题正则」补充 Lua 模式。
 - 纯 Lua Store 方式不压缩，EPUB 体积偏大（兼容性最好）。
 - 缩进模式把每行非空行都当作目录条目，最适合「目录/大纲式」TXT；混有大段散文时建议用显式章节标题或自定义正则。
-- `.doc` / RTF / FB2 / EPUB 走 **KOReader 已打开文档的 DOM 兜底**：`getToc()` 常为 0 条，插件会从正文识别「第一卷 / 第X章 / 第X节」重切分（v2.1.0 已兼容全角空格与中文标点），并有第二层「纯文本重建」兜底；若正文里确实没有任何可识别标题，则退化为按 256 KB 切分，但**每个分片都会列入目录**，仍可逐段跳转。若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」。
+- `.doc` / FB2 / EPUB 走 **KOReader 已打开文档的 DOM 兜底**：`getToc()` 常为 0 条，插件会从正文识别「第一卷 / 第X章 / 第X节」重切分（v2.1.0 已兼容全角空格与中文标点），并有第二层「纯文本重建」兜底；若正文里确实没有任何可识别标题，则退化为按 256 KB 切分，但**每个分片都会列入目录**，仍可逐段跳转。若提取到的正文过少，插件会删除半成品并提示「另存为 .docx」。
+- `.rtf`（**v2.1.6 起**）改走**插件自解析源文件**（`rtf.lua`），不再依赖 DOM：KOReader 的 RTF 渲染器无法解析负数 `\u` 转义（如「第二章 远行」），会乱码并截断正文；自解析可拿到完整目录与正文，单个坏码点降级为占位符（提示「已跳过 N 处无法识别的字符」）。
 - DOM 兜底格式的**渲染 HTML 由 KOReader 引擎生成**，沙箱内用贴近真机的 mock 验证适配层与重切分逻辑，无法完整复现引擎输出，请以设备实测为准。日志里的「DOM HTML 样本」可用于核对实际结构。
 - `.html`/`.htm`/`.md` 由插件自解析，但只保留文本与标题层级：图片、复杂表格、CSS 布局不会还原（行内粗体/斜体/链接会转成纯文本）。
 - 非 UTF-8 的 `.md`/`.html` 依赖系统 `iconv` 做 GBK→UTF-8 解码；设备无 `iconv` 时按原始字节处理，可能乱码但不崩溃。
@@ -131,12 +134,12 @@
 - **转换后是空书 / 只有标题没有正文（v2.1.3 已修复）**：旧版对「全文无标题 + 末尾无空行」的 TXT（例如整本一行的纯正文）会丢掉全部正文，只生成 1 个空章。v2.1.3 起正文完整保留并自动分片。若仍遇到空书，请提供 `.txt2epub.log` 与源文件结构（行数 / 是否含标题）。
 - **不同格式同名文件互相覆盖 / 提示已有同名 EPUB（v2.1.2 已解决）**：输出名现在带格式标记（`_txt`/`_docx`/`_html`/`_md`/`_doc`），如 `big_novel_txt.epub` 与 `big_novel_docx.epub` 并存。若仍看到旧的无标记 `big_novel.epub`，那是 v2.1.1 及更早版本生成的遗留文件，可删除。
 - **TXT 目录不折叠 / 全平铺（v2.1.2 已修复）**：旧版 TXT 标题模式把卷/章/节层级压成 0 级，目录一长串不折叠。v2.1.2 保留已识别的层级，目录按卷→章→节嵌套；若你的 TXT 没有「第一卷/第X章/第X节」这类标题，可在「章节标题正则」补充后再转换。
-- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒）。**v2.1.4 起**转换前还会主动全量回收并把堆占用写入 `.txt2epub.log`。**v2.1.5 关键修复**：压缩版 docx（需 DEFLATE 解压）转换后约 8 秒被 Killed，根因是纯 Lua 逐字节解压 2.8MB XML 在 Kindle 上 CPU/内存爆炸（STORED 版无需解压故正常）；新版 inflate 优先调用 libz 做 C 级 raw 解压，无 ffi 时用优化的批量纯 Lua 解码，压缩版与 STORED 版行为一致。若仍崩溃，建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
+- **连续转换多个大文件后崩溃 / 被 Killed**：v2.1.2 在每次转换收尾都做双重内存回收并断开协程/解码缓存引用，避免多次转换累积；真机若仍 OOM，主因多为 KOReader 打开 docx 的原生 DOM 渲染占用（日志中每次 opening 数秒）。**v2.1.4 起**转换前还会主动全量回收并把堆占用写入 `.txt2epub.log`。**v2.1.6 关键修复**：v2.1.5 曾为加速压缩版 docx 而引入 ffi/libz 快路径，但真机 `crash.log` 显示 `ffi.load: z` 后立即 `Killed`——KOReader 自身已声明 zlib 符号，与插件 cdef 在 32 位 ABI 下冲突导致无限内存增长。v2.1.6 **移除 FFI 快路径**，回归经真机验证的纯 Lua 解压并加输出/迭代熔断（坏流只报友好错误，绝不 OOM）。若仍崩溃，多为 KOReader 打开 docx 的原生 DOM 占用：建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
 - **打开已转换的 .epub 再点转换，正文出现两个目录（v2.1.4 已处理）**：`.epub` 本身多为转换产物，重复转换会把原书名页/目录当正文再包一层。v2.1.4 起会对 `.epub` 先弹确认提示，误点选「取消」即可；确需重新打包再点「继续转换」。
 - **GBK 中文文本转换无目录 / 内容乱码（v2.1.4 已修复）**：设备无 `iconv` 时旧版会丢目录与正文。v2.1.4 内置纯 Lua GB2312 解码兜底，无需 `iconv` 即可正确识别中文标题与正文。
 - **标题只写在 `<span>` 里的 HTML 无目录（v2.1.4 已修复）**：这类无 `<hN>` 的内联标签 HTML 现在会从短标题行恢复多级目录。
 - **损坏的 .docx 提示看不懂（v2.1.5 已改进）**：文件损坏或图片错误时不再弹出整段 Lua 栈轨迹，而是显示简明中文提示（如「此文件不是有效的 .docx，无法转换，请重新导出/另存后再试」）；详细技术信息仍记录在 `.txt2epub.log`。
-- **RTF / FB2 目录不全、正文有乱码（v2.1.5 已改进）**：KOReader 渲染 RTF 时可能把负 Unicode 字符显示为乱码、并产生双重 HTML 实体。插件现在会多次解码实体、清洗乱码后再识别章节，乱码不再阻断目录。**但 RTF 内容缺失源于 KOReader 渲染引擎（可能只返回部分正文），插件无法补回未返回的内容**——重要文档请先另存为 `.docx` 再转换。
+- **RTF 目录不全、正文有乱码（v2.1.6 已解决）**：旧版走 KOReader DOM，其 RTF 渲染器无法解析负数 `\u` 转义（「第二章 远行」等），会在此乱码并截断，只返回部分正文——插件无法补回 DOM 未返回的内容。v2.1.6 起 `.rtf` 改由插件直接解析源文件（`rtf.lua`），正确解码 `\u`（含负数）、`\par`、`\b` 标题，完整目录与正文均能保留，个别坏码点降级为占位符并提示「已跳过 N 处无法识别的字符」。FB2 仍走 DOM 兜底（多次解码实体 + 乱码清洗）。
 - **`.docx` 目录不全 / 只有几章（v2.1.1 重点修复）**：看 `.txt2epub.log` 新增的「**Word 标题体检**」行。若「样式标题 0、兜底重切 是」，说明设备上的 `.docx` 丢了 Word 标题样式，插件已自动从正文文本恢复章节标题（`第X章 / 第X节` 等短段落），目录应完整；若「文本候选标题」仍为 0，说明正文写法不在默认识别范围内，可在「设置章节标题正则」补充 Lua 模式。v2.1.1 起每个 256 KB 分片都会列入目录，即使完全无标题也不会只剩 1 条。
 - **无目录 / 只有 1 条目录（`.doc` 等 DOM 格式）**：查看 `.txt2epub.log` 的「正文标题数 / 重切分」。若为 0，说明正文没有可识别标题或 HTML 结构与预期不同，可补充「章节标题正则」；v2.1.0 起即使为 0 也会把分片逐条列入目录。
 - **点转换后崩溃/重启**：低内存或 UI 阻塞所致。v2.1.0 已把 CRC-32 从逐位纯 Lua 换成 `bit` 库/查表实现（大文档从分钟级降到秒级），并提前释放 ZIP 原始缓冲；**v2.1.1 更进一步**：超大章节按段流式写盘、不再拼整章大字符串，且 Word 样式丢失时先恢复标题以免生成 2.2 MB 巨型单章，消除大 `.docx` 的 OOM `Killed`。若仍发生，请提供 `.txt2epub.log` 与 `crash.log`。

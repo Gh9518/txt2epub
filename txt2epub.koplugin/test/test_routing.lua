@@ -3,8 +3,9 @@
 -- 防止再退化成 v2.0.0 那样产出「只剩标题」的空书。
 --
 -- 覆盖：
---   1) convert() 分派：.txt/.docx -> _dispatch_convert（自解析）；
---      .doc/.rtf/.epub/.fb2 -> _convert_document（DOM 兜底）
+--   1) convert() 分派：.txt/.docx/.rtf -> _dispatch_convert（自解析）；
+--      .doc/.epub/.fb2 -> _convert_document（DOM 兜底）
+--      （v2.1.6 起 .rtf 改走自解析 rtf.lua，避免 KOReader DOM 对负数 \u 乱码/截断）
 --   2) 空结果体检：is_empty_document_result 能识别"疑似空书"
 --   3) build_epub_from_document 第三返回值 stats 含 visible_chars
 --   4) build_epub_from_docx 对 sample_stored.docx 仍产出多级目录 + 完整正文（端到端）
@@ -125,7 +126,7 @@ r, ok = route_of("/x/旧版.doc")
 check(".doc -> 通用 DOM 兜底", r == "dom", r)
 
 r, ok = route_of("/x/a.rtf")
-check(".rtf -> 通用 DOM 兜底", r == "dom", r)
+check(".rtf -> 插件自解析（v2.1.6 起，避免 DOM 乱码/截断）", r == "selfparse:.rtf", r)
 
 r, ok = route_of("/x/a.epub")
 check(".epub -> 通用 DOM 兜底", r == "dom", r)

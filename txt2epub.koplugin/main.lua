@@ -106,11 +106,14 @@ end
 --   .txt                  -> 章节正则 / 空格缩进
 --   .docx                 -> OOXML（Word 标题样式 -> 多级目录）
 --   .html/.htm/.md/.markdown -> markup.lua（<hN> / # 标题 -> 多级目录）
--- 其余格式（.doc/.rtf/.fb2/.epub 等）走 KOReader 已打开文档的 DOM 兜底。
+--   .rtf                  -> rtf.lua（直接解析源文件，正确解码 \u 负数转义；
+--                            v2.1.6 起不再走 KOReader DOM，避免乱码/截断）
+-- 其余格式（.doc/.fb2/.epub 等）走 KOReader 已打开文档的 DOM 兜底。
 local SELF_PARSE_EXT = {
     [".txt"] = true, [".docx"] = true,
     [".html"] = true, [".htm"] = true,
     [".md"] = true, [".markdown"] = true,
+    [".rtf"] = true,
 }
 
 function TXT2EPUB:is_txt_file()
@@ -1288,6 +1291,8 @@ end
 function TXT2EPUB:_dispatch_convert(file, out_path, base, ext)
     if ext == ".docx" then
         self:_safe(function() self:_run_docx(file, out_path, base) end, "docx 转换")
+    elseif ext == ".rtf" then
+        self:_safe(function() self:_run_rtf(file, out_path, base) end, "RTF 转换")
     elseif ext == ".html" or ext == ".htm" or ext == ".md" or ext == ".markdown" then
         self:_safe(function() self:_run_markup(file, out_path, base) end, "标记文档转换")
     else
@@ -1557,6 +1562,79 @@ end
 ------------------------------------------------------------------------
 -- Word(.docx) 转换入口（参照 _run，但在协程中执行、逐章 yield，避免主线程阻塞）
 ------------------------------------------------------------------------
+------------------------------------------------------------------------
+-- RTF 转换入口（v2.1.6）：插件直接解析源文件，绕开 KOReader DOM 对负数 \u 的
+-- 乱码/截断问题。协程逐章 yield，错误只提示不 panic。
+------------------------------------------------------------------------
+function TXT2EPUB:_run_rtf(file, out_path, base)
+    self:_open_progress(nil, "build")
+    self:_async_run(
+        function()
+            self._in_async = true
+            local r = self:_do_convert_rtf(file, out_path, base)
+            self._in_async = false
+            return r
+        end,
+        function(err)
+            self._in_async = false
+            self:_close_progress()
+            UIManager:show(InfoMessage:new{ text = self:_friendly_error(err) })
+        end,
+        function(res)
+            self:_close_progress()
+            res = res or {}
+            local extra = ""
+            if res.garbled and res.garbled > 0 then
+                extra = string.format(_("\n（已跳过 %d 处无法识别的字符，其余内容正常转换）"), res.garbled)
+            end
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("✓ 转换完成：共 %d 章\n已保存：\n%s%s"), res.count or 0, out_path, extra),
+                timeout = 5,
+            })
+        end
+    )
+end
+
+function TXT2EPUB:_do_convert_rtf(file, out_path, base)
+    local opts = {
+        indent = self:get_indent(),
+        style = self:get_style(),
+        book_title = base,
+        uid = "urn:uuid:" .. Converter.gen_uid(),
+        modified = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        title_page = true,
+    }
+    pcall(collectgarbage, "collect")
+    pcall(collectgarbage, "collect")
+    self:_log("开始由 RTF 源文件解析生成 EPUB（不经 KOReader DOM）：" .. out_path)
+    local build_ok, count, stats
+    local status, perr = pcall(function()
+        build_ok, count, stats = Converter.build_epub_from_rtf(file, out_path, opts, {
+            on_yield = function()
+                if self._in_async then coroutine.yield() end
+            end,
+            on_progress = function(i)
+                self._progress_i = i
+                self._progress_total = nil
+                if i % 25 == 0 then
+                    self:_log(string.format("写入进度：%d 章", i))
+                end
+            end,
+        })
+    end)
+    if not status then
+        error("生成 EPUB 失败：" .. tostring(perr))
+    end
+    if not build_ok then
+        error("生成 EPUB 失败")
+    end
+    stats = stats or {}
+    self:_log(string.format("RTF 自解析：可见正文段落 %d，标题 %d，跳过乱码 %d，共 %d 章",
+        stats.body_paras or 0, stats.headings or 0, stats.garbled or 0, count or 0))
+    self:_set_progress(count, nil)
+    return { count = count, garbled = stats.garbled or 0 }
+end
+
 function TXT2EPUB:_run_docx(file, out_path, base)
     self:_open_progress(nil, "build")
     self:_async_run(
