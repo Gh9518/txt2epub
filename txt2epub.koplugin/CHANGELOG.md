@@ -2,6 +2,22 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.7（2026-11-18，真机第五轮反馈：移除 FFI 后 big_novel.docx / long_chapter.docx 仍崩溃）
+
+新一轮 `crash (1).log` + `txt2epub (2).log` 推翻了 v2.1.6 的根因判断：新日志里**没有** `ffi.load: z`，但转换仍被 `Killed`；`txt2epub.log` 停在「开始由 Word 生成 EPUB」，且转换前 Lua 堆已达 28415KB / 30653KB。新增 `test/test_fixes_v217.lua`（20 项双解释器全通过）。
+
+**真正的根因**：旧 docx 流程是「先把 document.xml 全解压成 2.8MB 字符串 → 再 parse_document_xml 生成 7327 个段落表」。用钩子测量 GC **前**的瞬时峰值：`inflate.raw` 返回瞬间 ~9.6MB heap / 12.5MB RSS，随后 `parse_document_xml` 冲到 ~18MB RSS（2.8MB 全文 + 7000+ table 同时驻留）。真机转换前 KOReader 已渲染 DOM，Lua 堆基线 28-30MB，叠加这个瞬时尖峰即被内核 OOM killer 杀掉。本地此前只测 GC 后的 5.5MB、且 64 位地址空间充足，故漏判。32 位 Kindle 上一次性分配 2.8MB 连续串还易因地址空间碎片失败/触发 GC 风暴。
+
+**修复**（功能零损失，段落逐段验证完全一致）：
+- `inflate.lua` 新增 `raw_stream`：每产出一块调用 sink，不构建完整结果串；保留 `raw` API 不变。
+- `docx.lua` 新增增量段落解析器 `make_stream_parser` + 流式条目读取 `read_entry_stream`：解压即解析，凑成 `<w:p>` 立即 emit 并丢弃源文本。big_novel 瞬时堆峰值 9.6MB→3.8MB、RSS 18MB→13.7MB，单次最大分配 2.8MB→32KB。
+- **纠正 v2.1.6 的错误结论**：FFI 不是崩溃根因（移除后仍崩）；v2.1.6 移除 FFI、加熔断本身仍是合理的安全加固，予以保留，但文档不再将其描述为「崩溃根因修复」。
+
+**顺带消除两处同类瞬时大分配隐患**（全局效率审视）：
+- `rtf.lua` 的 `blank_ignored_groups` 由「逐字节建表」改为「按特殊字符边界整段切片」，行为经 oracle 逐字节对比完全一致；2.4MB RTF RSS 39.8MB→25.9MB。
+- `converter.lua` 的 TXT `build_epub_streaming.emit` 改为先按段估算体积、超限直接分片，不再先拼出整章 XHTML 大串（与 docx/rtf 的 paragraphs 路径一致）。
+- DOM 兜底路径 `build_epub_from_document` 经评估其 raw_html 本就由 DOM 完整给出，改动会影响章节数/目录，遵循「不损失功能效果」原则未改动。
+
 ## v2.1.6（2026-11-17，真机第四轮反馈：崩溃仍在 + RTF 目录不全）
 
 依据用户新一轮上传的 `crash (1).log`/`crash (2).log`、`domtxt2epub.log`、`txt2epub(1).log` 修复；新增 `test/test_fixes_v216.lua`（16 项双解释器全通过），`test_routing` 更新至 26 项全通过。

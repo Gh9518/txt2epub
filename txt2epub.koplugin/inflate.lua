@@ -6,23 +6,26 @@
 --   既没有 zlib 的 2 字节头 (0x78 0x9C)，也没有尾部 4 字节 adler32 校验。
 --   KOReader 自带的 ffi/zlib.zlib_uncompress() 只接受完整 zlib 流，喂 raw deflate 会失败。
 --
--- 【v2.1.6 重要变更：移除 FFI zlib 快路径】
---   v2.1.5 曾加入 ffi+libz 的 inflateInit2_(windowBits=-15) 快路径，期望降低 CPU/内存峰值。
---   但真机 (Kindle PW4, v2026.07) crash.log 显示：转换大 .docx 时打印 "ffi.load: z" 后
---   立即被内核 OOM killer 杀掉（只有 Killed、无 Lua 堆栈）。根因是 KOReader 自身已用
---   ffi/zlib.lua 声明过 z_stream / inflateInit2_ / inflate 等符号，插件再用自定义结构体重声明，
---   在这一环境下 ABI/符号解析错位，导致 avail_out 读到错误值、produced 计算异常、
---   输出块无限 append 到 parts 直至内存耗尽。
---   本地（无 KOReader 环境）因 zlib 声明干净、64 位 ABI 而测不出，故 v2.1.5 未能发现。
---   而 v2.1.4 的纯 Lua 路径曾在真机成功转换同一 big_novel.docx（见 txt2epub.log 22:28:58）。
---   => 因此 v2.1.6 彻底移除 FFI 快路径，回归经过真机验证的纯 Lua 实现，并新增「熔断」保护：
---      输出总量/迭代次数一旦越界立即返回明确错误，绝不无限 append、绝不把 KOReader 拖崩。
---   效率权衡：纯 Lua 在本机解压 2.8MB XML 约 1 秒，真机约数秒，稳定远重于微小速度差。
+-- 【版本沿革 / 崩溃根因订正】
+--   v2.1.5 曾加入 ffi+libz 快路径。v2.1.6 依据当时 crash.log 的 "ffi.load: z"→"Killed"
+--   判定为 FFI ABI 冲突并移除之，加「熔断」保护（输出总量/迭代越界即报错，绝不无限 append）。
+--   v2.1.7 真机第五轮反馈证明：移除 FFI 后新日志里已无 ffi.load:z，但 big_novel.docx /
+--   long_chapter.docx 仍被 Killed —— FFI 并非根因。真正原因是「先把整份 document.xml
+--   解压成 2.8MB 字符串、再解析成 7000+ 段落表」的瞬时内存尖峰（GC 前 ~18MB RSS），
+--   叠加真机已渲染 DOM 的 28-30MB 基线堆触发 OOM。为此 v2.1.7 新增 raw_stream，
+--   让 docx「解压即解析」，把最大单次分配从 2.8MB 降到 32KB。
+--   v2.1.6 的纯 Lua 回归 + 熔断作为安全加固予以保留。
+--   效率权衡：纯 Lua 在本机解压 2.8MB XML 约 0.4 秒，真机约数秒，稳定远重于微小速度差。
 --
 -- 对外 API：
 --   inflate.raw(data [, expected_size]) -> string | nil, err
 --     data           : 裸 deflate 字节流（ZIP 条目的压缩数据区）
 --     expected_size  : 可选，ZIP 中央目录记录的解压后大小；给定时做严格长度校验 + 熔断上界
+--   inflate.raw_stream(data [, expected_size], sink) -> true | nil, err   (v2.1.7)
+--     同 raw，但每产出一块就调用 sink(chunk_string)，不构建完整结果字符串。
+--     用于 docx 的「解压即解析」流式管道：避免 2.8MB 全文与 7000+ 段落表同时驻留
+--     造成瞬时内存尖峰（真机高基线堆下叠加触发 OOM Killed 的根因）。
+--     sink 返回 false 可提前中止（返回 nil, "输出被消费者中止"）。
 --
 -- 参考：RFC 1951、zlib contrib/puff.c（Mark Adler）的 canonical Huffman 构造/解码算法。
 
@@ -236,12 +239,14 @@ end
 --   hist     : 最近 ≤ WINDOW 字节的回溯窗口（字符串，供 LZ77 批量复制）
 --   全程带熔断：输出总量/迭代次数越界立即返回错误，绝不无限 append。
 ------------------------------------------------------------------------
-function inflate.raw(data, expected_size)
+-- 内部核心：emit(chunk) 每产出一块调用一次；emit 返回 false 表示消费者中止。
+-- 返回 true | nil, err；size 校验用累计 total（流式模式无需完整结果串）。
+local function core(data, expected_size, emit)
     if type(data) ~= "string" then
         return nil, "deflate 数据不是字符串"
     end
     if data == "" then
-        if expected_size == 0 then return "" end
+        if expected_size == 0 then return true end
         return nil, "deflate 数据为空"
     end
 
@@ -257,15 +262,15 @@ function inflate.raw(data, expected_size)
 
     local bits, align = new_bitreader(data)
     local WINDOW, FLUSH = 32768, 8192
-    local out, nout = {}, 0
     local cur, ncur = {}, 0
     local hist = ""
     local total = 0
 
+    local emit_aborted = false
     local function flush_cur()
         if ncur == 0 then return true end
         local s = table.concat(cur, "", 1, ncur)
-        nout = nout + 1; out[nout] = s
+        if emit(s) == false then emit_aborted = true; return false end
         local hl = #hist
         if hl + ncur <= WINDOW then
             hist = hist .. s
@@ -299,7 +304,7 @@ function inflate.raw(data, expected_size)
         else
             rep = pat:rep(math.ceil(len / pl)):sub(1, len)
         end
-        nout = nout + 1; out[nout] = rep
+        if emit(rep) == false then emit_aborted = true; return false end
         local nl = #rep
         if hl + nl <= WINDOW then
             hist = hist .. rep
@@ -387,12 +392,33 @@ function inflate.raw(data, expected_size)
         if final == 1 then break end
     end
 
-    if not flush_cur() then return nil, "解压输出超限（收尾）" end
-    local result = table.concat(out, "", 1, nout)
-    if expected_size and expected_size >= 0 and #result ~= expected_size then
-        return nil, string.format("解压大小不符：得到 %d 字节，预期 %d 字节", #result, expected_size)
+    if not flush_cur() then
+        if emit_aborted then return nil, "输出被消费者中止" end
+        return nil, "解压输出超限（收尾）"
     end
-    return result
+    if expected_size and expected_size >= 0 and total ~= expected_size then
+        return nil, string.format("解压大小不符：得到 %d 字节，预期 %d 字节", total, expected_size)
+    end
+    return true
+end
+
+-- 一次性解压为字符串（保持原有 API 语义）
+function inflate.raw(data, expected_size)
+    local out, nout = {}, 0
+    local ok, err = core(data, expected_size, function(s)
+        nout = nout + 1; out[nout] = s
+        return true
+    end)
+    if not ok then return nil, err end
+    return table.concat(out, "", 1, nout)
+end
+
+-- 流式解压：每产出一块调用 sink(chunk)，不构建完整结果串。
+-- 消费者可就地增量处理（如边解压边解析 XML 段落），把内存峰值从「整份解压结果」
+-- 降为「一块 + 消费者状态」。sink 返回 false 可提前中止。
+function inflate.raw_stream(data, expected_size, sink)
+    if type(sink) ~= "function" then return nil, "sink 不是函数" end
+    return core(data, expected_size, sink)
 end
 
 return inflate

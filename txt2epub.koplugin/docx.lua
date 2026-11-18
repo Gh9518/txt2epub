@@ -11,6 +11,9 @@
 --     零 C 库/ffi 依赖，跨 Lua 5.1/5.3/LuaJIT 与所有设备一致，且内存有界。
 --   * 解析 word/document.xml：逐段（<w:p>）提取文本，并通过 <w:pStyle w:val> / <w:outlineLvl w:val>
 --     判定该段是否为“标题”及其层级（Heading1 -> 1，Heading2 -> 2 …），从而天然支持多级目录。
+--   * v2.1.7 流式管道：document.xml 走「解压即解析」——inflate.raw_stream 每产出一块就喂给
+--     make_stream_parser，凑成 <w:p> 即 emit 段落并丢弃源文本，避免 2.8MB 全文 + 7000+ 段落表
+--     同时驻留的瞬时内存尖峰（真机高基线堆下叠加触发 OOM）。parse_document_xml 作为纯函数保留供测试。
 --   * 完全不依赖任何第三方 Lua/C 库：ZIP 解析与 DEFLATE 解压都是纯 Lua 算术。
 --
 -- 对外 API：
@@ -258,6 +261,61 @@ function DocxReader.parse_document_xml(xml)
 end
 
 ------------------------------------------------------------------------
+-- 增量段落解析器（v2.1.7）：把 inflate 流式输出的块喂进来，遇到完整的
+-- <w:p>...</w:p> 就立刻解析并 emit，随后丢弃该段源文本。
+--   目的：不再把整份 2.8MB document.xml 与 7000+ 段落表同时压在 Lua 堆上。
+--   原 parse_document_xml 保留（供测试/纯函数场景），二者解析出的段落序列完全一致。
+--   emit(level, text)：level 为 nil 表示正文。
+------------------------------------------------------------------------
+local function make_stream_parser(emit)
+    local buf = ""          -- 尚未凑成完整段落的尾部
+    local function feed(chunk)
+        if not chunk or chunk == "" then return end
+        buf = buf .. chunk
+        while true do
+            local pstart = find_tag(buf, "p", 1)
+            if not pstart then
+                -- 没有起始标签：只保留末尾可能是不完整 "<w:p..." 的片段，其余丢弃。
+                -- 用最后一个 '<' 作为安全切点，避免跨块被切断的标签丢失。
+                local last_lt = buf:match(".*()<")
+                if last_lt then buf = buf:sub(last_lt) else buf = "" end
+                break
+            end
+            -- 自闭合 <w:p/> 或 <w:p .../>：无闭合标签，立即成段
+            local gt = buf:find(">", pstart, true)
+            if gt and buf:sub(gt - 1, gt) == "/>" then
+                local pslice = buf:sub(pstart, gt)
+                emit(paragraph_level(pslice), extract_text(pslice))
+                buf = buf:sub(gt + 1)
+            else
+                local close = find_close_tag(buf, "p", pstart)
+                local cgt = close and buf:find(">", close, true)
+                if not cgt then
+                    -- 闭合标签可能跨块被切断，保留从 pstart 起等待更多数据
+                    buf = buf:sub(pstart)
+                    break
+                end
+                local pslice = buf:sub(pstart, cgt)
+                emit(paragraph_level(pslice), extract_text(pslice))
+                buf = buf:sub(cgt + 1)
+            end
+        end
+    end
+    local function finish()
+        -- 畸形文件兜底：残留的最后一个未闭合段落，按整段处理（与 parse_document_xml 一致）
+        if buf ~= "" then
+            local pstart = find_tag(buf, "p", 1)
+            if pstart then
+                local pslice = buf:sub(pstart)
+                emit(paragraph_level(pslice), extract_text(pslice))
+            end
+            buf = ""
+        end
+    end
+    return feed, finish
+end
+
+------------------------------------------------------------------------
 -- 从 docProps/core.xml 取书名（<dc:title>...</dc:title>）
 ------------------------------------------------------------------------
 local function extract_core_title(xml)
@@ -372,6 +430,58 @@ local function read_entry(self, name)
 end
 
 ------------------------------------------------------------------------
+-- 流式读取某条目：解压出的块直接喂给 sink(chunk)，不构建完整字符串。
+-- 用于 document.xml 的「解压即解析」管道，避免 2.8MB 全文与段落表同时驻留。
+-- 返回 true | nil, err。_entry_reader 测试钩子仍受支持（整块喂入）。
+------------------------------------------------------------------------
+local function read_entry_stream(self, name, sink)
+    if DocxReader._entry_reader then
+        local full = DocxReader._entry_reader(name)
+        if not full then return nil, "测试钩子未返回条目：" .. name end
+        sink(full)
+        return true
+    end
+    local e = self.entries[name]
+    if not e then return nil end
+    local lo = e.local_off + 1
+    if lo + 30 > #self.data or le32(self.data, lo) ~= 0x04034b50 then
+        return nil, "本地文件头签名错误或数据截断：" .. name
+    end
+    local fnlen = le16(self.data, lo + 26)
+    local extralen = le16(self.data, lo + 28)
+    if not fnlen or not extralen then return nil, "本地文件头字段截断：" .. name end
+    local data_start = lo + 30 + fnlen + extralen
+    if data_start + e.comp_size - 1 > #self.data then
+        return nil, "条目压缩数据截断：" .. name
+    end
+    -- 只切出压缩块本身（big_novel 约 117KB），而非整份解压结果
+    local comp = self.data:sub(data_start, data_start + e.comp_size - 1)
+    if e.method == 0 then
+        sink(comp)
+        return true
+    elseif e.method == 8 then
+        if DocxReader._inflate == nil then
+            local ok, mod = pcall(require, "inflate")
+            if ok and type(mod) == "table" and type(mod.raw_stream) == "function" then
+                DocxReader._inflate = mod
+            else
+                DocxReader._inflate = false
+            end
+        end
+        if DocxReader._inflate == false then
+            return nil, "缺少 inflate 流式解压模块（inflate.lua 版本过旧）"
+        end
+        local ok, res, ierr = pcall(DocxReader._inflate.raw_stream, comp, e.uncomp_size, sink)
+        if not ok then return nil, "解压失败：" .. tostring(res) end
+        if not res then return nil, "解压失败：" .. tostring(ierr) end
+        comp = nil
+        return true
+    else
+        return nil, "不支持的压缩方式：" .. tostring(e.method)
+    end
+end
+
+------------------------------------------------------------------------
 -- 对外：读取 .docx 文件
 --   用 pcall 兜底：畸形/截断/伪造的 ZIP 里任何未预料的算术或索引异常，
 --   一律转成「解析失败」的明确错误返回，绝不把 Lua 异常抛给上层 UI。
@@ -387,44 +497,51 @@ local function read_impl(path)
     if not zip then return nil, err end
     local self = { entries = zip.entries, data = zip.data }
 
-    -- document.xml 必需
-    local doc_xml, derr = read_entry(self, "word/document.xml")
-    if not doc_xml then
-        -- 某些文档路径大小写不同，做一次宽松匹配
+    -- 定位 document.xml 条目（含大小写宽松匹配）
+    local doc_name = "word/document.xml"
+    if not self.entries[doc_name] then
         for nm in pairs(self.entries) do
-            if nm:lower() == "word/document.xml" then
-                doc_xml, derr = read_entry(self, nm)
-                break
-            end
+            if nm:lower() == "word/document.xml" then doc_name = nm; break end
         end
     end
-    if not doc_xml then
-        return nil, derr or "找不到 word/document.xml"
-    end
+    if not self.entries[doc_name] then return nil, "找不到 word/document.xml" end
 
-    -- 书名（core.xml 可选）
+    -- 书名（core.xml 可选，通常仅数百字节，走普通读取）
     local title
-    local core_xml = read_entry(self, "docProps/core.xml")
-    if not core_xml then
+    local core_name = "docProps/core.xml"
+    if not self.entries[core_name] then
         for nm in pairs(self.entries) do
-            if nm:lower() == "docprops/core.xml" then core_xml = read_entry(self, nm); break end
+            if nm:lower() == "docprops/core.xml" then core_name = nm; break end
         end
     end
-    if core_xml then title = extract_core_title(core_xml) end
+    if self.entries[core_name] then
+        local core_xml = read_entry(self, core_name)
+        if core_xml then title = extract_core_title(core_xml) end
+        core_xml = nil
+    end
 
-    local paragraphs = DocxReader.parse_document_xml(doc_xml)
-    -- 主动释放大对象：ZIP 原始字节（2.8MB）与解压后的 document.xml（2.7MB）
-    -- 若一直留到函数返回，会和 7000+ 个段落 table 同时压在 Lua 堆上；
-    -- Kindle 剩余内存本就紧张，这正是大 .docx 转换被 OOM killer 杀掉时
-    -- crash.log 只留一行 "Killed"（没有 Lua 堆栈）的原因。
-    doc_xml, core_xml, derr = nil, nil, nil
+    -- ============ 核心：流式「解压即解析」管道 ============
+    -- 旧做法：inflate 出整份 2.8MB XML 字符串 -> parse_document_xml 生成 7000+
+    -- 段落表；两者同时驻留，GC 前瞬时峰值达 ~10MB heap / 18MB RSS。真机转换前
+    -- 基线堆已 28-30MB（已渲染 DOM），叠加这个瞬时尖峰即触发内核 OOM Killed。
+    -- 新做法：每块解压输出立刻喂给增量解析器，凑成完整 <w:p> 就 emit 成段落并
+    -- 丢弃该段源文本；内存中同时存在的只有 32KB 解压窗口 + 当前段落 + 结果段落表。
+    local paragraphs = {}
+    local feed_parser, finish_parser = make_stream_parser(function(level, text)
+        paragraphs[#paragraphs + 1] = level
+            and { kind = "heading", level = level, text = text }
+            or { kind = "body", text = text }
+    end)
+    local sok, serr = read_entry_stream(self, doc_name, feed_parser)
+    if not sok then return nil, serr or "读取 document.xml 失败" end
+    finish_parser()
+
+    -- 主动释放 ZIP 原始字节（脚本级 119KB，堆上仍应尽早断开引用）
     self.data = nil
     zip.data = nil
     data = nil
-    -- LuaJIT 对「大字符串 + 用过的 Huffman 临时表」常需两轮全量回收才真正
-    -- 归还堆：真机连续转换时若只回收一轮，DEFLATE docx 解压峰值会残留，
-    -- 多次叠加后触发内核 OOM（crash.log 只有 Killed、无 Lua 堆栈）。
-    collectgarbage("collect")
+    -- 归还 Huffman 临时表等；不依赖这里的回收来「补回」内存 —— 真正的
+    -- 修复是上面的流式管道让峰值本身不再出现。保留 collect 以利连续多次转换。
     collectgarbage("collect")
     return { title = title, paragraphs = paragraphs }
 end

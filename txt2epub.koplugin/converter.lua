@@ -1801,8 +1801,12 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
         -- XHTML（Kindle indexer / 渲染卡顿、甚至重启的已知诱因）。
         paras = expand_long_paras(paras, MAX_CHAPTER_BYTES, 64 * 1024)
         i = i + 1
-        local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
-        if #xhtml > MAX_CHAPTER_BYTES and #paras > 1 then
+        -- v2.1.7：先按「每段字节 + 包装开销」估算整章体积，超限直接走分片，
+        -- 不再先用 build_chapter_xhtml 拼出整章大串（那会造成与 docx 旧路径
+        -- 同类的瞬时内存尖峰，叠加高基线堆可触发 OOM）。与 paragraphs 路径一致。
+        local approx = 0
+        for k = 1, #paras do approx = approx + #paras[k] + XHTML_PARA_OVERHEAD end
+        if approx > MAX_CHAPTER_BYTES and #paras > 1 then
             -- 超长章节：按段落切分为多个文件
             local chunk = {}
             local size = 0
@@ -1833,6 +1837,7 @@ function Converter.build_epub_streaming(line_iter, kind, arg, book_title, out_pa
             end
             flush_part()
         else
+            local xhtml = Converter.build_chapter_xhtml(title, paras, indent, level)
             local fname = string.format("OEBPS/chapter_%04d.xhtml", i)
             zip:add(fname, xhtml)
             toc[#toc + 1] = { file = fname, title = title, level = level, toc = true }

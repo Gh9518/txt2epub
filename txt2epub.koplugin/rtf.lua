@@ -81,7 +81,26 @@ local function blank_ignored_groups(text)
     local i = 1
     local skip_depth = 0   -- >0 表示当前处于需丢弃组内
     local depth = 0        -- 全局组深度
+    -- v2.1.7 效率优化：原实现对「每个字节」都 out[#out+1]=text:sub(i,i)，
+    -- 2MB RTF 会生成 200 万个表项 + 200 万个单字节串，RSS 实测冲到 ~40MB，
+    -- 叠加真机 28-30MB 基线堆即 OOM。这里在遇到特殊字符（\ { }）之前用
+    -- text:sub(from,to) 整段切片，行为与逐字节完全一致，但表项数从 O(字节)
+    -- 降为 O(特殊字符数)。丢弃组内的普通段整段替换为等长空格。
     while i <= n do
+        -- 找下一个需要特殊处理的字符（反斜杠或花括号）
+        local sp = text:find("[\\{}]", i)
+        if not sp then
+            -- 余下全是普通字符，整段处理
+            local seg = text:sub(i)
+            out[#out + 1] = (skip_depth > 0) and string.rep(" ", #seg) or seg
+            break
+        end
+        if sp > i then
+            -- 普通字符连续段：整段切片，避免逐字节建表
+            local seg = text:sub(i, sp - 1)
+            out[#out + 1] = (skip_depth > 0) and string.rep(" ", #seg) or seg
+            i = sp
+        end
         local c = text:sub(i, i)
         if c == "\\" then
             -- 读取控制字名称（不解析参数，够用）
@@ -116,13 +135,6 @@ local function blank_ignored_groups(text)
             if skip_depth == depth then skip_depth = 0 end
             depth = depth - 1
             out[#out + 1] = c
-            i = i + 1
-        else
-            if skip_depth > 0 then
-                out[#out + 1] = " "   -- 丢弃组内字符替换为空白
-            else
-                out[#out + 1] = c
-            end
             i = i + 1
         end
     end
