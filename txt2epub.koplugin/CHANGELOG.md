@@ -2,6 +2,21 @@
 
 本文件记录各版本的功能与修复。日常使用请看 [README.md](README.md)。
 
+## v2.1.8（2026-11-18，真机第六轮反馈：big_novel.docx 目录卷不折叠）
+
+真机确认 v2.1.7 已彻底解决崩溃：`bigtxt2epub.log` / `longtxt2epub.log` 均显示「EPUB 生成成功」，`crash (2).log` 只有用户主动退出（`exit code: 85`）、无 `Killed`。本轮唯一问题是 **big_novel.docx 目录卷不折叠**，而 long_chapter.docx 正常折叠。
+
+**根因**：big_novel.docx 的 3 个「第X卷」与 301 个「第X章」在 Word 里全用 `Heading1`（层级=1），60 个「第X节」用 `Heading2`（层级=2）；`docx.lua` 只按样式定层级、不看书名文本语义，于是卷章同级，`nest_toc` 把 300+ 条平铺，卷节点无法折叠。而 long_chapter.docx 是卷/章/节 = H1/H2/H3，天然三级。TXT/RTF/DOM 路径本就用 `title_level`（卷=0/章=1/节=2），不受影响——这解释了为何只有 docx 出问题。
+
+**修复**：`build_epub_from_paragraphs` 入口新增 `refine_heading_levels`，**保守触发**——仅当标题文本能明确识别出比原始样式更多的层级种类时，才用「卷/部/册/篇=0、章/回=1、节/集/幕=2」替换 level：
+- big_novel：文本 3 级 > 样式 2 级 → 触发，目录变为 3 卷(0)/305 章(1)/60 节(2) 三级折叠。
+- long_chapter：文本 3 级 = 样式 3 级 → 不触发，保持原样。
+- markup `<hN>` 正确分级、标题无「第X章」字样的文档 → 不触发，零影响。
+
+因放在段落路径公共入口，也顺带修复了 markup 出现「卷章同为 `<h1>`」的同类平铺。真机日志新增「目录层级精修」诊断行。新增 `test/test_fixes_v218.lua`（26 项双解释器全通过）。
+
+**打包**：从此版起 zip 解压后直接得到 `txt2epub.koplugin/` 文件夹，可整目录拷入 KOReader `plugins/`，无需再手动改名。
+
 ## v2.1.7（2026-11-18，真机第五轮反馈：移除 FFI 后 big_novel.docx / long_chapter.docx 仍崩溃）
 
 新一轮 `crash (1).log` + `txt2epub (2).log` 推翻了 v2.1.6 的根因判断：新日志里**没有** `ffi.load: z`，但转换仍被 `Killed`；`txt2epub.log` 停在「开始由 Word 生成 EPUB」，且转换前 Lua 堆已达 28415KB / 30653KB。新增 `test/test_fixes_v217.lua`（20 项双解释器全通过）。

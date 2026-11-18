@@ -1692,10 +1692,17 @@ function TXT2EPUB:_do_convert_docx(file, out_path, base)
             -- 标题来源体检：Word 样式标题为 0 时会从正文文本兜底恢复章节。
             -- 真机排查「目录不全 / 崩溃」时看这一行即可确认是否生效。
             on_diag = function(rst)
-                self:_log(string.format(
-                    "Word 标题体检：样式标题 %d，正文段 %d，文本候选标题 %d，兜底重切 %s（提升 %d，模式 %s）",
-                    rst.word_headings or 0, rst.body_paras or 0, rst.text_titles or 0,
-                    rst.enabled and "是" or "否", rst.promoted or 0, rst.mode or "-"))
+                if rst.level_refined then
+                    -- v2.1.8：样式层级被压平（卷/章同为 Heading1），已按文本语义分级
+                    self:_log(string.format(
+                        "目录层级精修：已按文本「卷/章/节」重分级，调整 %d 章（原层级 %d 种 → 文本层级 %d 种），目录可折叠",
+                        rst.level_changed or 0, rst.level_orig_kinds or 0, rst.level_text_kinds or 0))
+                else
+                    self:_log(string.format(
+                        "Word 标题体检：样式标题 %d，正文段 %d，文本候选标题 %d，兜底重切 %s（提升 %d，模式 %s）",
+                        rst.word_headings or 0, rst.body_paras or 0, rst.text_titles or 0,
+                        rst.enabled and "是" or "否", rst.promoted or 0, rst.mode or "-"))
+                end
             end,
             on_progress = function(i)
                 self._progress_i = i

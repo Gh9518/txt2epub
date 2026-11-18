@@ -2082,6 +2082,73 @@ function Converter.recover_docx_headings(paragraphs, opts)
 end
 
 ------------------------------------------------------------------------
+-- v2.1.8 层级精修：修复「卷/章同为 Heading1」导致目录不折叠
+--   真机 big_novel.docx 的 3 个「第X卷」与 301 个「第X章」全标 Heading1、
+--   60 个「第X节」标 Heading2 —— 卷章同级，nest_toc 把 300+ 条平铺，
+--   卷节点无法折叠。long_chapter.docx 则是卷 H1/章 H2/节 H3，天然三级。
+--   本函数只在「文本语义层级比原始样式层级更丰富」时才用
+--   「卷/部/册/篇=0、章/回=1、节/集/幕=2」替换，保守触发，避免破坏：
+--     * long_chapter（样式3级 == 文本3级，不动）
+--     * markup <hN> 正确分级的文档（样式3级 == 文本3级，不动）
+--     * 标题无「第X章」字样、title_level 只能给默认值的文档（无明确文本层级，不动）
+--   同时放在公共入口，一并修复 markup 出现「卷章同为 <h1>」的同类平铺。
+------------------------------------------------------------------------
+-- 仅当标题文本「明确命中」卷/章/节标记时返回语义层级(0/1/2)，否则 nil。
+-- 与 title_level 的区别：后者对无标记文本默认返回 1，不能用于判断层级是否更丰富。
+local function explicit_title_level(line)
+    line = trim(line or "")
+    if line == "" then return nil end
+    -- 英文：Volume/Book/Part=0、Chapter=1、Section=2（须后跟空白与内容）
+    if line:match("^[Ss]ection%s+%w") then return 2 end
+    if line:match("^[Cc]hapter%s+%w") then return 1 end
+    if line:match("^[Vv]olume%s+%w") or line:match("^[Bb]ook%s+%w")
+        or line:match("^[Pp]art%s+%w") then return 0 end
+    -- 中文：取最先出现的标记（plain find 定位，规避 Lua [] 多字节不可靠），
+    -- 且须在前 12 字节内（标题起始处），避免正文式长句误判。
+    local best_pos, best_lv = nil, nil
+    for ch, lv in pairs(LV_MARKERS) do
+        local p = line:find(ch, 1, true)
+        if p and p <= 12 and (best_pos == nil or p < best_pos) then
+            best_pos, best_lv = p, lv
+        end
+    end
+    return best_lv
+end
+
+-- 精修段落序列里 heading 的 level。返回是否触发、改动数、原/文本层级种类数。
+local function refine_heading_levels(paragraphs)
+    local orig_kinds, text_kinds = {}, {}
+    local orig_count, text_count = 0, 0
+    local tlevels, hidx = {}, 0
+    for k = 1, #paragraphs do
+        local p = paragraphs[k]
+        if p and p.kind == "heading" then
+            hidx = hidx + 1
+            local ol = p.level or 1
+            if not orig_kinds[ol] then orig_kinds[ol] = true; orig_count = orig_count + 1 end
+            local tl = explicit_title_level(p.text or "")
+            tlevels[hidx] = tl
+            if tl and not text_kinds[tl] then text_kinds[tl] = true; text_count = text_count + 1 end
+        end
+    end
+    -- 保守触发：文本明确层级 >= 2 种，且严格多于原始层级种类
+    if text_count >= 2 and text_count > orig_count then
+        local hi, refined = 0, 0
+        for k = 1, #paragraphs do
+            local p = paragraphs[k]
+            if p and p.kind == "heading" then
+                hi = hi + 1
+                if tlevels[hi] then p.level = tlevels[hi]; refined = refined + 1 end
+            end
+        end
+        return true, refined, orig_count, text_count
+    end
+    return false, 0, orig_count, text_count
+end
+Converter.refine_heading_levels = refine_heading_levels
+Converter.explicit_title_level = explicit_title_level
+
+------------------------------------------------------------------------
 -- 「段落序列 -> EPUB」统一流水线。
 --   .docx / .html / .htm / .md 先各自解析成同样的段落序列：
 --     { {kind="heading", level=N, text=T} | {kind="body", text=T}, ... }
@@ -2096,6 +2163,14 @@ function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, 
 
     paragraphs = paragraphs or {}
     book_title = book_title or opts.book_title or "未命名"
+
+    -- v2.1.8：精修被样式压平的层级（卷/章同为 Heading1 → 卷不折叠）。
+    -- 在消费段落前一次性完成，仅改 heading 的 level 字段，不增删段落、不损失内容。
+    local lvl_applied, lvl_changed, lvl_orig_kinds, lvl_text_kinds = refine_heading_levels(paragraphs)
+    if lvl_applied and type(hooks.on_diag) == "function" then
+        pcall(hooks.on_diag, { level_refined = true, level_changed = lvl_changed,
+            level_orig_kinds = lvl_orig_kinds, level_text_kinds = lvl_text_kinds })
+    end
 
     local zip = ZipWriter:new(out_path)
     zip:add("mimetype", "application/epub+zip")
@@ -2228,7 +2303,8 @@ function Converter.build_epub_from_paragraphs(paragraphs, book_title, out_path, 
     zip:add("META-INF/container.xml", Converter.build_container())
     zip:close()
     collectgarbage("collect")
-    return true, #toc, { chapter_count = #toc, split_parts = split_parts }
+    return true, #toc, { chapter_count = #toc, split_parts = split_parts,
+        level_refined = lvl_applied, level_changed = lvl_changed }
 end
 
 ------------------------------------------------------------------------

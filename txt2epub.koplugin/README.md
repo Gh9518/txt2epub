@@ -30,6 +30,7 @@
 - **Direct RTF parsing (v2.1.6)** — `.rtf` is now parsed from the source file by `rtf.lua` (negative `\u` escapes, `\par`, `\b` headings) instead of KOReader's DOM, which garbled and truncated chapters containing negative `\u` codes; full TOC and body are preserved.
 - **Smaller footprint (v2.1.5)** — the GB2312 table is base64-encoded and lazily decoded, shrinking `gbk.lua` from 62 KB to 27 KB and the plugin package accordingly.
 - **Cleaner TOC titles (v2.1.5)** — punctuation between a chapter marker and its title (`第1章：开端`, `第六卷 - 狂暴`) becomes a single space; brackets and full-width spaces are preserved.
+- **Foldable `.docx` volume TOC (v2.1.8)** — when a `.docx` marks both 卷 (volumes) and 章 (chapters) with the same Word style (`Heading1`), the TOC used to go flat and volumes could not be folded. The plugin now conservatively re-levels headings by text semantics (`卷=0 / 章=1 / 节=2`) **only when** the text reveals more levels than the styles do, so correctly-styled books (and `<hN>` HTML) are untouched.
 
 ### Install
 1. Unzip the release archive — it contains a single top-level folder `txt2epub.koplugin/`.
@@ -134,6 +135,7 @@
 - **转换后是空书 / 只有标题没有正文（v2.1.3 已修复）**：旧版对「全文无标题 + 末尾无空行」的 TXT（例如整本一行的纯正文）会丢掉全部正文，只生成 1 个空章。v2.1.3 起正文完整保留并自动分片。若仍遇到空书，请提供 `.txt2epub.log` 与源文件结构（行数 / 是否含标题）。
 - **不同格式同名文件互相覆盖 / 提示已有同名 EPUB（v2.1.2 已解决）**：输出名现在带格式标记（`_txt`/`_docx`/`_html`/`_md`/`_doc`），如 `big_novel_txt.epub` 与 `big_novel_docx.epub` 并存。若仍看到旧的无标记 `big_novel.epub`，那是 v2.1.1 及更早版本生成的遗留文件，可删除。
 - **TXT 目录不折叠 / 全平铺（v2.1.2 已修复）**：旧版 TXT 标题模式把卷/章/节层级压成 0 级，目录一长串不折叠。v2.1.2 保留已识别的层级，目录按卷→章→节嵌套；若你的 TXT 没有「第一卷/第X章/第X节」这类标题，可在「章节标题正则」补充后再转换。
+- **Word 文档目录「卷」不折叠（v2.1.8 已修复）**：有些 `.docx`（如 big_novel.docx）把「第X卷」和「第X章」都标成同一级标题样式（Heading1），插件原先只按样式定层级，卷章平铺、卷无法折叠。v2.1.8 会检测标题文本语义：仅当文本能识别出比样式更多的层级（卷/章/节）时才按「卷→章→节」重分级，日志出现「目录层级精修」行；本身已正确分级的 Word（卷 H1/章 H2/节 H3）、HTML `<hN>` 文档不受影响。重新转换一次即可看到卷下可折叠的章节。
 - **转换 big_novel.docx / long_chapter.docx 后崩溃 / 被 Killed（v2.1.7 根治）**：真机证据链——`txt2epub.log` 转换前堆已达 28-30MB、停在「开始由 Word 生成 EPUB」，`crash.log` 随后 `Killed`；新日志中已无 `ffi.load: z` 仍崩，故与 FFI 无关。真正根因是旧 docx 流程「先全解压成 2.8MB 字符串、再解析成 7000+ 段落表」的**瞬时内存尖峰**（GC 前实测 ~18MB RSS，含一份 2.8MB 连续串），叠加 KOReader 已渲染 DOM 的高基线堆后触发内核 OOM。**v2.1.7 改为流式「解压即解析」**：每块解压输出立即增量解析成段落并丢弃源文本，单次最大分配由 2.8MB 降到 32KB，实测瞬时堆峰值 9.6MB→3.8MB、RSS 18MB→13.7MB，目录/正文逐段完全一致。v2.1.6 移除 FFI、加解压熔断的加固予以保留（坏流只报友好错误）。若仍崩溃，多为 KOReader 打开 docx 的原生 DOM 占用：建议重启 KOReader 后用菜单「选择文件」直接选 docx（不先打开文档，避开 DOM 渲染），并提供 `.txt2epub.log` + `crash.log`。
 - **打开已转换的 .epub 再点转换，正文出现两个目录（v2.1.4 已处理）**：`.epub` 本身多为转换产物，重复转换会把原书名页/目录当正文再包一层。v2.1.4 起会对 `.epub` 先弹确认提示，误点选「取消」即可；确需重新打包再点「继续转换」。
 - **GBK 中文文本转换无目录 / 内容乱码（v2.1.4 已修复）**：设备无 `iconv` 时旧版会丢目录与正文。v2.1.4 内置纯 Lua GB2312 解码兜底，无需 `iconv` 即可正确识别中文标题与正文。
